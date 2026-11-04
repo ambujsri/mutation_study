@@ -1,0 +1,23 @@
+# Runtime dependencies, pinned to the versions the full test suite and the
+# end-to-end pipeline were verified against (Python 3.11.15, macOS 15 arm64).
+#
+# Requires Python >= 3.11. Python 3.10 is NOT supported: the last scipy line
+# that supports 3.10 (1.15.x) ships macOS arm64 wheels whose compiled
+# extensions fail to load on macOS 26+ with
+#   ImportError: dlopen(... _spropack ...) section '__DATA/__thread_bss' has a
+#   zero-fill section type, but offset field is not zero
+# scipy >= 1.16 fixes this but requires Python >= 3.11.
+#
+# Model artifacts in outputs/models/ are pickled by joblib and are NOT portable
+# across scikit-learn versions. Changing the scikit-learn pin below requires
+# re-running `python -m src.train` before `python -m src.predict`.
+numpy==2.4.6
+pandas==3.1.0
+pyarrow==26.0.1
+scikit-learn==1.9.1
+scipy==1.17.1
+PyYAML==6.0.3
+joblib==1.6.0
+tabulate==0.10.0        # required by pandas .to_markdown() in src/predict.py
+matplotlib==3.11.2
+seaborn==0.13.2

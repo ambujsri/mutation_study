@@ -1,0 +1,6 @@
+# Development / CI tooling (install with: pip install -r requirements-dev.txt)
+-r requirements.txt
+ruff==0.14.10
+mypy==1.17.1
+pytest==8.4.2
+types-PyYAML==6.0.12.20250915

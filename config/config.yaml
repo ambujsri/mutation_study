@@ -1,0 +1,170 @@
+# =============================================================================
+# Medvolt.AI — Protein Mutation-Effect Prediction & Candidate Prioritization
+#
+# Run configuration: environment setup and scientific / modelling DECISIONS only.
+# Fixed facts about the dataset (column names, categorical codes, value ranges,
+# naming conventions) live in src/common/constants.py.
+# Rule of thumb: if a reviewer could reasonably ask "why this value?" for a given
+# run, it belongs here. See docs/CODING_GUIDELINES.md, section 4.
+#
+# Relative paths resolve against the project root (the folder holding main.py).
+# =============================================================================
+
+project:
+  name: medvolt_protein_engineering
+  random_seed: 20261102          # Dataset-mandated seed (README_DATASET.txt)
+
+# -----------------------------------------------------------------------------
+# File system
+# -----------------------------------------------------------------------------
+paths:
+  raw_dir: data/raw
+  processed_dir: data/processed
+  models_dir: outputs/models
+  figures_dir: outputs/figures
+  reports_dir: outputs/reports
+
+files:
+  labeled: labeled_mutations.csv
+  candidates: candidate_mutations_unlabeled.csv
+  embeddings: protein_embeddings.csv
+  processed_train: processed_train.parquet          # .parquet | .csv
+  processed_candidates: processed_candidates.parquet
+  feature_manifest: feature_manifest.json           # feature lists + data-quality report
+  cv_fold_summary: cv_fold_summary.csv              # per-fold sizes, group counts, leakage
+  oof_predictions: oof_predictions.parquet          # every out-of-fold prediction (long format)
+  cv_fold_metrics: cv_fold_metrics.csv              # metrics per strategy x model x target x fold
+  cv_metrics_summary: cv_metrics_summary.csv        # pooled OOF + fold mean/std metrics
+  model_selection: model_selection.json             # chosen model per target and why
+  training_metadata: training_metadata.json         # provenance for saved models (models_dir)
+  top_candidates: top_10_candidates.csv             # Top-K prioritization table
+  top_candidates_markdown: top_10_candidates.md     # same table for the technical report
+  all_predictions: candidate_predictions.csv        # all candidates, scored and flagged
+  ablation_study: ablation_study.csv                # feature-subset ablation metrics
+  ablation_markdown: ablation_study.md              # same, for the technical report
+  interpretation_markdown: candidate_interpretation.md  # per-candidate scientific breakdown
+
+# -----------------------------------------------------------------------------
+# Feature engineering decisions
+# -----------------------------------------------------------------------------
+features:
+  secondary_structure_encoding: onehot   # onehot | ordinal
+  add_abs_deltas: true                   # add |Δ| alongside signed Δ
+  add_relative_position: true            # position / protein_length
+  embedding_reduction:
+    enabled: true
+    method: pca                          # fit inside each CV fold (no leakage)
+    n_components: 16
+
+# -----------------------------------------------------------------------------
+# Data-quality policy
+# -----------------------------------------------------------------------------
+quality:
+  numeric_imputation: median             # median | mean; fit on labeled data only
+  replace_inf_with_nan: true
+  drop_rows_with_missing_target: true    # targets are never imputed
+  fail_on_row_loss_in_merge: true
+  fail_on_duplicate_ids: true
+
+# -----------------------------------------------------------------------------
+# Validation
+# -----------------------------------------------------------------------------
+validation:
+  strategies: [random, protein_group, family_group]   # any subset of these three
+  primary_strategy: family_group         # most realistic proxy for OOD candidates
+  n_splits: 5                            # >= 2 and <= number of groups (7 families in training)
+  shuffle: true                          # shuffle rows/groups before folding (seeded)
+  metrics: [rmse, mae, r2, spearman]     # any subset of these four
+
+# -----------------------------------------------------------------------------
+# Models
+# All preprocessing below (imputation, scaling, embedding PCA) is fit inside
+# each training fold as part of one sklearn Pipeline; nothing sees validation data.
+# -----------------------------------------------------------------------------
+models:
+  scaler: standard                       # standard | robust | none
+  # One model per target is trained for every candidate listed here.
+  # Available: ridge | random_forest | gradient_boosting (sklearn gradient-boosted trees)
+  candidates:
+    ridge:
+      alpha: 1.0
+    random_forest:
+      n_estimators: 500
+      max_depth: null
+      min_samples_leaf: 3
+      max_features: 0.3
+      n_jobs: -1
+    gradient_boosting:
+      n_estimators: 400
+      learning_rate: 0.03
+      max_depth: 3
+      subsample: 0.8
+  # Best model per target = best pooled out-of-fold value of this metric under
+  # validation.primary_strategy. Spearman because Phase 4 ranks candidates.
+  selection_metric: spearman             # must be one of validation.metrics
+  refit_on_full_data: true               # refit selected models on all labeled data for Phase 4
+  save_fold_pipelines: true              # save the selected model's primary-strategy fold pipelines
+                                         # (fold ensemble for prediction uncertainty in Phase 4)
+
+# -----------------------------------------------------------------------------
+# Ablation study (Phase 5)
+# Each subset names feature groups defined in src/common/constants.py
+# (FEATURE_GROUPS). Columns absent from the Phase 1 manifest are skipped, so a
+# subset naming `deltas` is empty if delta features were disabled upstream.
+# -----------------------------------------------------------------------------
+ablation:
+  # Run under this CV strategy; null = validation.primary_strategy.
+  strategy: null
+  # null = the model Phase 3 selected for each target; else a models.candidates key.
+  model: null
+  baseline: D_full                       # subset the deltas are measured against
+  subsets:
+    A_tabular_no_embeddings: [physicochemical, sequence]
+    B_embeddings_only: [embeddings]
+    C_tabular_plus_embeddings: [physicochemical, sequence, embeddings]
+    D_full: [physicochemical, sequence, structural, deltas, embeddings]
+    # Leave-one-group-out arms that isolate each source's marginal contribution.
+    E_all_tabular_no_embeddings: [physicochemical, sequence, structural, deltas]
+    F_full_minus_deltas: [physicochemical, sequence, structural, embeddings]
+    G_full_minus_structural: [physicochemical, sequence, deltas, embeddings]
+
+# -----------------------------------------------------------------------------
+# Scientific interpretation (Phase 5)
+# -----------------------------------------------------------------------------
+interpretation:
+  n_candidates: 4                        # how many of the Top K to write up in detail
+  # Feature values quoted per candidate, alongside predictions and uncertainty.
+  report_features:
+    - conservation_score
+    - solvent_accessibility
+    - distance_to_active_site
+    - local_confidence_score
+    - delta_hydrophobicity
+    - delta_charge
+    - delta_volume
+
+# -----------------------------------------------------------------------------
+# Candidate prioritization
+# -----------------------------------------------------------------------------
+prioritization:
+  top_k: 10
+  # Point estimate per candidate: mean over the CV fold pipelines (whose spread
+  # gives the uncertainty), or the single model refit on all labeled data.
+  point_estimate: ensemble_mean          # ensemble_mean | final_model
+  min_fold_models: 2                     # fewer fold models than this cannot give a spread
+  # Objectives are normalized within the candidate pool before weighting, so
+  # scores are relative to this pool and not absolute merit.
+  score_normalization: rank              # rank | minmax
+  weights:
+    stability: 0.5                       # applied to -ddG (stabilizing = better)
+    function: 0.5                        # applied to functional_score (higher = better)
+  # Weights are rescaled to sum to 1. Penalty is applied to the normalized
+  # combined uncertainty, so it is on the same 0-1 scale as the objectives.
+  uncertainty_penalty: 0.25
+  ood_flag_unseen_family: true           # flag candidates from families absent in training
+
+# -----------------------------------------------------------------------------
+# Logging
+# -----------------------------------------------------------------------------
+logging:
+  level: INFO                            # DEBUG | INFO | WARNING | ERROR
