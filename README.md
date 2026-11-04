@@ -177,7 +177,8 @@ config/config.yaml              Run setup and decisions: paths, seed, CV, models
 data/raw/                       Original CSVs (read-only inputs)
 data/processed/                 Engineered train / candidate tables + feature manifest
 notebooks/
-  exploratory_analysis.ipynb    EDA and visual quality control
+  exploratory_analysis.ipynb    EDA: completeness, duplicates, distributions, outliers,
+                                mutation types, correlations, data-quality findings
 src/common/                     constants.py (dataset facts, naming), config.py, io.py
 src/data_processing.py          Ingestion, merge with embeddings, anomaly checks, features
 src/model.py                    Model architectures: feature blocks, pipelines, registry
