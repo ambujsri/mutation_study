@@ -22,6 +22,7 @@ from src.common.constants import (
     LOG_FORMAT,
     LOG_LEVELS,
     REQUIRED_CONFIG_SECTIONS,
+    Activation,
     Bound,
     Encoding,
     Imputation,
@@ -32,6 +33,7 @@ from src.common.constants import (
     Scaler,
     ScoreNormalization,
     SplitStrategy,
+    TorchDevice,
 )
 
 # Keys that must be YAML booleans (true / false).
@@ -45,6 +47,9 @@ _BOOLEAN_KEYS = (
     "quality.fail_on_duplicate_ids",
     "validation.shuffle",
     "evaluation.figures",
+    "torch.batch_norm",
+    "torch.standardize_stability_target",
+    "torch.save_fold_models",
     "prioritization.ood_flag_unseen_family",
     "models.refit_on_full_data",
     "models.save_fold_pipelines",
@@ -152,6 +157,26 @@ def _check_subset(cfg: dict[str, Any], dotted_key: str, allowed: list[str]) -> l
     return errors
 
 
+def _check_torch_layers(cfg: dict[str, Any]) -> list[str]:
+    """Return errors unless the network's layer widths are positive integers.
+
+    ``hidden_dims`` defines the shared backbone and must hold at least one
+    layer; ``head_hidden_dim`` may be ``null``, which makes each task head a
+    single ``Linear`` projection.
+    """
+    errors = []
+    dims = get_by_path(cfg, "torch.hidden_dims", None)
+    if not isinstance(dims, list) or not dims:
+        errors.append("torch.hidden_dims must be a non-empty list of layer widths")
+    elif any(not isinstance(d, int) or isinstance(d, bool) or d < 1 for d in dims):
+        errors.append(f"torch.hidden_dims must all be positive integers, got {dims}")
+
+    head = get_by_path(cfg, "torch.head_hidden_dim", None)
+    if head is not None and (not isinstance(head, int) or isinstance(head, bool) or head < 1):
+        errors.append(f"torch.head_hidden_dim must be a positive integer or null, got {head!r}")
+    return errors
+
+
 def _enum_values(enum_cls: type[Enum]) -> list[str]:
     """List the string values of an ``Enum`` (the allowed config choices)."""
     return [member.value for member in enum_cls]
@@ -234,6 +259,9 @@ def validate_config(cfg: dict[str, Any]) -> None:
         errors.append("interpretation.report_features must be a non-empty list of column names")
     errors.extend(_check_choice(cfg, "prioritization.score_normalization", _enum_values(ScoreNormalization)))
     errors.extend(_check_choice(cfg, "features.embedding_reduction.method", _enum_values(ReductionMethod)))
+    errors.extend(_check_choice(cfg, "torch.device", _enum_values(TorchDevice)))
+    errors.extend(_check_choice(cfg, "torch.activation", _enum_values(Activation)))
+    errors.extend(_check_torch_layers(cfg))
 
     candidates = get_by_path(cfg, "models.candidates", None)
     models_allowed = _enum_values(ModelName)

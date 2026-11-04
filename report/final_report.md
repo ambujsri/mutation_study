@@ -144,12 +144,18 @@ the training fold's and *different* from whole-table statistics, so the test has
 multiplying validation features by 1000 while setting validation targets to −999 leaves every
 fitted transformer and model coefficient bit-identical.
 
+**Baseline benchmark.** Three model families — regularized linear (ridge), random forest and
+gradient-boosted trees — were cross-validated on both targets under all three splitting
+strategies and scored on MAE, RMSE, R², Pearson and Spearman. The full 18-row grid is in
+`results/metrics/baseline_benchmark.md`.
+
 **Model selection** used pooled out-of-fold Spearman under `family_group`, chosen because the
 deliverable is a *ranking*: Spearman measures the ordering quality Top-10 selection depends on,
-while RMSE would reward calibration the downstream task never uses. Gradient boosting won both
-targets (`stability_ddG`: 0.507 ridge / 0.522 forest / **0.556** boosting; `functional_score`:
-0.708 / 0.721 / **0.747**), consistently across all three strategies, so the choice is not an
-artefact of one split.
+while RMSE would reward calibration the downstream task never uses. Pearson is reported beside it
+so that poor calibration stays visible rather than hidden behind a good ranking. Gradient
+boosting won both targets (`stability_ddG`: 0.507 ridge / 0.522 forest / **0.556** boosting;
+`functional_score`: 0.708 / 0.721 / **0.747**) consistently across all three strategies, so the
+choice is not an artefact of one split.
 
 ---
 
@@ -157,10 +163,10 @@ artefact of one split.
 
 Selected model, pooled out-of-fold under `family_group`:
 
-| Target | RMSE | R² | Spearman | Fold SD |
-|---|---|---|---|---|
-| `stability_ddG` | 0.426 | 0.341 | 0.556 | 0.052 |
-| `functional_score` | 0.069 | 0.634 | 0.747 | 0.031 |
+| Target | MAE | RMSE | R² | Pearson | Spearman | Fold SD (Spearman) |
+|---|---|---|---|---|---|---|
+| `stability_ddG` | 0.338 | 0.426 | 0.341 | 0.598 | 0.556 | 0.052 |
+| `functional_score` | 0.055 | 0.069 | 0.634 | 0.796 | 0.747 | 0.031 |
 
 **Functional retention is substantially more predictable than stability** (R² 0.63 vs 0.34). With
 RMSE 0.426 on a target whose predicted range is −0.149 to +1.41, the model resolves *coarse*
@@ -315,7 +321,8 @@ model disagreement, not total predictive error, and is blind to domain shift. **
 pool-relative**, not an absolute measure of merit. **No feature attribution** was computed, so
 Section 7 reasons from input values and general biophysics rather than per-prediction
 attributions — SHAP on the selected model is the single cheapest improvement available. Finally,
-results are **environment-sensitive**: bit-reproducible for a fixed environment, but a
+results are **environment-sensitive**: two runs in one environment agree to floating-point
+tolerance (6.7e-16) rather than byte-for-byte, and a
 scikit-learn change reorders the Top 10. Pinned versions and seed are in
 `results/models/training_metadata.json`.
 

@@ -76,13 +76,44 @@ def test_compute_metrics_known_values() -> None:
     assert scores[const.Metric.MAE.value] == pytest.approx(0.25)
     assert scores[const.Metric.R2.value] == pytest.approx(1 - 1 / 5)
     assert scores[const.Metric.SPEARMAN.value] == pytest.approx(1.0)
+    # Pearson is below 1 where Spearman is exactly 1: the ordering is perfect
+    # but the relationship is not linear. This is why both are reported.
+    assert scores[const.Metric.PEARSON.value] == pytest.approx(0.9827076, abs=1e-6)
+    assert scores[const.Metric.PEARSON.value] < scores[const.Metric.SPEARMAN.value]
 
 
-def test_compute_metrics_constant_prediction_gives_nan_spearman() -> None:
-    """Rank correlation is undefined for constant predictions and is reported as NaN, not 0."""
-    scores = ev.compute_metrics(np.array([1.0, 2.0, 3.0]), np.array([2.0, 2.0, 2.0]), [const.Metric.SPEARMAN])
+def test_compute_metrics_covers_every_declared_metric() -> None:
+    """Every ``Metric`` member has a calculator, so adding one cannot silently no-op."""
+    scores = ev.compute_metrics(np.array([1.0, 2.0, 3.0]), np.array([1.1, 1.9, 3.2]), list(const.Metric))
 
-    assert np.isnan(scores[const.Metric.SPEARMAN.value])
+    assert set(scores) == {metric.value for metric in const.Metric}
+    assert all(np.isfinite(value) for value in scores.values())
+
+
+def test_pearson_and_spearman_differ_on_a_monotone_nonlinear_fit() -> None:
+    """A perfectly ranked but curved fit scores 1.0 on Spearman and less on Pearson."""
+    y_true = np.array([1.0, 2.0, 3.0, 4.0, 5.0])
+    y_pred = y_true**3  # monotone, strongly nonlinear
+
+    scores = ev.compute_metrics(y_true, y_pred, [const.Metric.PEARSON, const.Metric.SPEARMAN])
+
+    assert scores[const.Metric.SPEARMAN.value] == pytest.approx(1.0)
+    assert scores[const.Metric.PEARSON.value] < 0.95
+
+
+@pytest.mark.parametrize("metric", [const.Metric.PEARSON, const.Metric.SPEARMAN])
+def test_correlation_is_nan_for_a_constant_prediction(metric: const.Metric) -> None:
+    """Correlation is undefined for constant predictions and is reported as NaN, not 0."""
+    scores = ev.compute_metrics(np.array([1.0, 2.0, 3.0]), np.array([2.0, 2.0, 2.0]), [metric])
+
+    assert np.isnan(scores[metric.value])
+
+
+def test_metric_directions_are_declared_for_every_metric() -> None:
+    """Model selection needs to know which way each metric points."""
+    assert set(const.METRIC_GREATER_IS_BETTER) == set(const.Metric)
+    assert const.METRIC_GREATER_IS_BETTER[const.Metric.PEARSON] is True
+    assert const.METRIC_GREATER_IS_BETTER[const.Metric.RMSE] is False
 
 
 def test_compute_metrics_returns_only_requested() -> None:
@@ -316,3 +347,125 @@ def test_evaluation_summary_reports_the_same_numbers_as_training(trained_cfg: di
     for target, choice in selection.items():
         row = headline[headline[const.COL_TARGET] == target].iloc[0]
         assert row[column] == pytest.approx(choice["value"], nan_ok=True)
+
+
+# =============================================================================
+# Baseline benchmark (assignment Task 3)
+# =============================================================================
+@pytest.fixture()
+def multi_model_cfg(cfg: dict[str, Any], raw_files: dict[str, Path]) -> dict[str, Any]:
+    """Config carrying all three baseline families, kept cheap enough to fit in a test."""
+    cfg["validation"]["n_splits"] = TEST_N_SPLITS
+    cfg["features"]["embedding_reduction"]["n_components"] = TEST_N_COMPONENTS
+    cfg["models"]["candidates"] = {
+        const.ModelName.RIDGE.value: {"alpha": 1.0},
+        const.ModelName.RANDOM_FOREST.value: {
+            "n_estimators": 5, "max_depth": 3, "min_samples_leaf": 1,
+            "max_features": 0.5, "n_jobs": 1,
+        },
+        const.ModelName.GRADIENT_BOOSTING.value: {
+            "n_estimators": 5, "learning_rate": 0.1, "max_depth": 2, "subsample": 1.0,
+        },
+    }
+    validate_config(cfg)
+    pp.run_preprocessing(cfg)
+    tr.run_training(cfg)
+    return cfg
+
+
+def test_benchmark_covers_every_model_target_and_strategy(multi_model_cfg: dict[str, Any]) -> None:
+    """The Task 3 table is the full grid: one row per model x target x strategy."""
+    _, summary, _ = ev.load_evaluation_inputs(multi_model_cfg)
+
+    table = ev.benchmark_table(summary, multi_model_cfg)
+
+    n_models = len(multi_model_cfg["models"]["candidates"])
+    n_strategies = len(multi_model_cfg["validation"]["strategies"])
+    assert len(table) == n_models * n_strategies * len(const.TARGETS)
+    assert set(table[const.COL_MODEL]) == set(multi_model_cfg["models"]["candidates"])
+    assert set(table[const.CV_COL_STRATEGY]) == set(multi_model_cfg["validation"]["strategies"])
+    assert set(table[const.COL_TARGET]) == set(const.TARGETS.values())
+
+
+def test_benchmark_reports_every_configured_metric(multi_model_cfg: dict[str, Any]) -> None:
+    """All five regression metrics appear, Pearson and Spearman among them."""
+    _, summary, _ = ev.load_evaluation_inputs(multi_model_cfg)
+
+    table = ev.benchmark_table(summary, multi_model_cfg)
+
+    for metric in ev.configured_metrics(multi_model_cfg):
+        assert f"{const.POOLED_PREFIX}{metric.value}" in table.columns
+    for required in (const.Metric.MAE, const.Metric.RMSE, const.Metric.R2,
+                     const.Metric.PEARSON, const.Metric.SPEARMAN):
+        assert f"{const.POOLED_PREFIX}{required.value}" in table.columns
+
+
+def test_benchmark_values_match_the_saved_summary(multi_model_cfg: dict[str, Any]) -> None:
+    """The table re-presents the saved metrics; it never recomputes or refits."""
+    _, summary, _ = ev.load_evaluation_inputs(multi_model_cfg)
+
+    table = ev.benchmark_table(summary, multi_model_cfg)
+
+    keys = [const.COL_TARGET, const.COL_MODEL, const.CV_COL_STRATEGY]
+    expected = summary.set_index(keys)
+    for _, row in table.iterrows():
+        source = expected.loc[tuple(row[k] for k in keys)]
+        for metric in ev.configured_metrics(multi_model_cfg):
+            column = f"{const.POOLED_PREFIX}{metric.value}"
+            assert row[column] == pytest.approx(source[column], nan_ok=True)
+
+
+def test_benchmark_optimism_gap_is_random_minus_row(multi_model_cfg: dict[str, Any]) -> None:
+    """The gap column quantifies what the optimistic split would have added."""
+    _, summary, _ = ev.load_evaluation_inputs(multi_model_cfg)
+    column = f"{const.POOLED_PREFIX}{multi_model_cfg['models']['selection_metric']}"
+    random_ = const.SplitStrategy.RANDOM.value
+
+    table = ev.benchmark_table(summary, multi_model_cfg)
+
+    indexed = table.set_index([const.COL_TARGET, const.COL_MODEL, const.CV_COL_STRATEGY])
+    for (target, model, strategy), row in indexed.iterrows():
+        if strategy == random_:
+            assert np.isnan(row[const.EVAL_COL_OPTIMISM_GAP])  # nothing to compare against itself
+        else:
+            reference = indexed.loc[(target, model, random_), column]
+            assert row[const.EVAL_COL_OPTIMISM_GAP] == pytest.approx(reference - row[column])
+
+
+def test_benchmark_rows_follow_config_order(multi_model_cfg: dict[str, Any]) -> None:
+    """Rows read in the order the config declares, so the table is stable across runs."""
+    _, summary, _ = ev.load_evaluation_inputs(multi_model_cfg)
+
+    table = ev.benchmark_table(summary, multi_model_cfg)
+
+    first_target = next(iter(const.TARGETS.values()))
+    models = list(dict.fromkeys(table[table[const.COL_TARGET] == first_target][const.COL_MODEL]))
+    assert models == list(multi_model_cfg["models"]["candidates"])
+
+
+def test_benchmark_markdown_names_both_targets_and_all_models(multi_model_cfg: dict[str, Any]) -> None:
+    """The report section is self-describing: models, targets and the gap's definition."""
+    _, summary, _ = ev.load_evaluation_inputs(multi_model_cfg)
+    table = ev.benchmark_table(summary, multi_model_cfg)
+
+    markdown = ev.benchmark_to_markdown(table, multi_model_cfg)
+
+    assert "# Baseline model benchmark" in markdown
+    for target in const.TARGETS.values():
+        assert f"## {target}" in markdown
+    for model in multi_model_cfg["models"]["candidates"]:
+        assert model in markdown
+    assert const.EVAL_COL_OPTIMISM_GAP in markdown
+
+
+def test_run_evaluation_writes_the_benchmark_artifacts(trained_cfg: dict[str, Any]) -> None:
+    """The evaluation stage emits the Task 3 table as both CSV and Markdown."""
+    ev.run_evaluation(trained_cfg)
+
+    metrics_dir = Path(trained_cfg["paths"]["metrics_dir"])
+    csv_path = metrics_dir / trained_cfg["files"]["baseline_benchmark"]
+    md_path = metrics_dir / trained_cfg["files"]["baseline_benchmark_markdown"]
+    assert csv_path.is_file() and md_path.is_file()
+    written = read_table(csv_path)
+    assert not written.empty
+    assert f"{const.POOLED_PREFIX}{const.Metric.PEARSON.value}" in written.columns

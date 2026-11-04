@@ -20,7 +20,8 @@ important number for judging whether reported performance would survive
 deployment on unseen proteins.
 
 Run as a script, the module reloads the saved OOF predictions and metric
-summary, re-derives the headline table, and writes the evaluation figures to
+summary, re-derives the headline table and the Task 3 **baseline benchmark**
+(every model × target × strategy), and writes the evaluation figures to
 ``paths.figures_dir`` — nothing is recomputed from the models, so this stage is
 cheap and safe to re-run.
 """
@@ -35,12 +36,12 @@ from typing import Any
 
 import numpy as np
 import pandas as pd
-from scipy.stats import spearmanr
+from scipy.stats import pearsonr, spearmanr
 from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 
 from src.common import constants as const
 from src.common.config import DEFAULT_CONFIG_PATH, load_config, resolve_path, setup_logging
-from src.common.io import read_table
+from src.common.io import read_table, write_table
 from src.model import CVResults, FloatArray
 
 logger = logging.getLogger(__name__)
@@ -59,6 +60,11 @@ def compute_metrics(y_true: FloatArray, y_pred: FloatArray, metrics: list[const.
         const.Metric.RMSE: lambda: float(np.sqrt(mean_squared_error(y_true, y_pred))),
         const.Metric.MAE: lambda: float(mean_absolute_error(y_true, y_pred)),
         const.Metric.R2: lambda: float(r2_score(y_true, y_pred)),
+        const.Metric.PEARSON: lambda: (
+            float("nan")
+            if np.ptp(y_true) == 0 or np.ptp(y_pred) == 0
+            else float(pearsonr(y_true, y_pred).statistic)
+        ),
         const.Metric.SPEARMAN: lambda: (
             float("nan")
             if np.ptp(y_true) == 0 or np.ptp(y_pred) == 0
@@ -254,6 +260,94 @@ def headline_table(oof: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
 
 
 # =============================================================================
+# Baseline benchmark (assignment Task 3)
+# =============================================================================
+def benchmark_table(summary: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
+    """Tabulate every baseline model on both targets under every CV strategy.
+
+    This is the Task 3 deliverable view of the cross-validation ``src.train``
+    already ran: one row per model × target × strategy with all configured
+    pooled metrics, plus the per-fold spread and the signed gap against the
+    optimistic random split. No model is refit — the table is a presentation of
+    the saved out-of-fold metrics, so it cannot disagree with them.
+
+    Returns:
+        Rows ordered by target, then by config model order, then by strategy
+        order, so the table reads the way the config declares the experiment.
+    """
+    metrics = configured_metrics(cfg)
+    pooled_columns = [f"{const.POOLED_PREFIX}{metric.value}" for metric in metrics]
+    strategies = [s for s in cfg["validation"]["strategies"] if s in set(summary[const.CV_COL_STRATEGY])]
+    models = [m for m in cfg["models"]["candidates"] if m in set(summary[const.COL_MODEL])]
+    random_ = const.SplitStrategy.RANDOM.value
+    selection_column = f"{const.POOLED_PREFIX}{cfg['models']['selection_metric']}"
+
+    indexed = summary.set_index([const.COL_TARGET, const.COL_MODEL, const.CV_COL_STRATEGY])
+    rows = []
+    for target in const.TARGETS.values():
+        for model in models:
+            for strategy in strategies:
+                key = (target, model, strategy)
+                if key not in indexed.index:
+                    continue
+                row = indexed.loc[key]
+                record: dict[str, Any] = {
+                    const.COL_TARGET: target,
+                    const.COL_MODEL: model,
+                    const.CV_COL_STRATEGY: strategy,
+                    const.COL_N_SAMPLES: int(row[const.COL_N_SAMPLES]),
+                }
+                record.update({column: float(row[column]) for column in pooled_columns})
+                fold_std = f"{const.FOLD_STD_PREFIX}{cfg['models']['selection_metric']}"
+                record[fold_std] = float(row[fold_std]) if fold_std in row else float("nan")
+                # How much of this score the optimistic split would have added.
+                optimistic = (target, model, random_)
+                record[const.EVAL_COL_OPTIMISM_GAP] = (
+                    float(indexed.loc[optimistic, selection_column]) - float(row[selection_column])
+                    if optimistic in indexed.index and strategy != random_
+                    else float("nan")
+                )
+                rows.append(record)
+    return pd.DataFrame(rows)
+
+
+def benchmark_to_markdown(table: pd.DataFrame, cfg: dict[str, Any]) -> str:
+    """Render the baseline benchmark as a Markdown section for the technical report."""
+    primary = cfg["validation"]["primary_strategy"]
+    selection_metric = cfg["models"]["selection_metric"]
+    lines = [
+        "# Baseline model benchmark",
+        "",
+        f"- Models: {', '.join(dict.fromkeys(table[const.COL_MODEL]))}",
+        f"- Targets: {', '.join(const.TARGETS.values())}, modelled independently",
+        f"- Primary strategy: `{primary}`; selection metric: "
+        f"`{const.POOLED_PREFIX}{selection_metric}`",
+        "",
+        "All metrics are pooled over every out-of-fold prediction. Each model is re-fitted from "
+        "scratch inside every training fold, with imputation, scaling and embedding PCA as steps "
+        "**inside** the pipeline, so no fold sees its validation rows at fit time.",
+        "",
+        f"`{const.EVAL_COL_OPTIMISM_GAP}` is the random split's "
+        f"`{const.POOLED_PREFIX}{selection_metric}` minus this row's: the credit a model gets for "
+        "recognising proteins and families it has already seen.",
+        "",
+    ]
+    for target in const.TARGETS.values():
+        rows = table[table[const.COL_TARGET] == target]
+        if rows.empty:
+            continue
+        lines += [
+            f"## {target}",
+            "",
+            rows.drop(columns=const.COL_TARGET).to_markdown(
+                index=False, floatfmt=const.MARKDOWN_FLOAT_FORMAT
+            ),
+            "",
+        ]
+    return "\n".join(lines) + "\n"
+
+
+# =============================================================================
 # Figures
 # =============================================================================
 def _figure_paths(cfg: dict[str, Any]) -> dict[str, Path]:
@@ -425,17 +519,28 @@ def to_markdown(
     return "\n".join(lines) + "\n"
 
 
-def export_artifacts(markdown: str, cfg: dict[str, Any]) -> dict[str, Path]:
-    """Write the evaluation Markdown summary.
+def export_artifacts(
+    markdown: str, benchmark: pd.DataFrame, cfg: dict[str, Any]
+) -> dict[str, Path]:
+    """Write the evaluation summary and the baseline benchmark table.
 
     Returns:
         Mapping of artifact name to written path.
     """
-    path = resolve_path(cfg, "metrics_dir", "evaluation_markdown")
-    path.parent.mkdir(parents=True, exist_ok=True)
-    path.write_text(markdown, encoding=const.CONFIG_ENCODING)
-    logger.info("Wrote evaluation_markdown -> %s", path)
-    return {"evaluation_markdown": path}
+    paths = {
+        key: resolve_path(cfg, "metrics_dir", key)
+        for key in ("evaluation_markdown", "baseline_benchmark", "baseline_benchmark_markdown")
+    }
+    for path in paths.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    paths["evaluation_markdown"].write_text(markdown, encoding=const.CONFIG_ENCODING)
+    write_table(benchmark, paths["baseline_benchmark"])
+    paths["baseline_benchmark_markdown"].write_text(
+        benchmark_to_markdown(benchmark, cfg), encoding=const.CONFIG_ENCODING
+    )
+    for key, path in paths.items():
+        logger.info("Wrote %s -> %s", key, path)
+    return paths
 
 
 def run_evaluation(cfg: dict[str, Any]) -> pd.DataFrame:
@@ -453,9 +558,15 @@ def run_evaluation(cfg: dict[str, Any]) -> pd.DataFrame:
         )
     headline = headline_table(focus, cfg)
     gaps = log_optimism_gap(summary, cfg)
+    benchmark = benchmark_table(summary, cfg)
     figures = make_figures(focus, summary, cfg)
-    export_artifacts(to_markdown(headline, summary, gaps, figures, cfg), cfg)
-    logger.info("Evaluation complete: %d target rows, %d figures", len(headline), len(figures))
+    export_artifacts(to_markdown(headline, summary, gaps, figures, cfg), benchmark, cfg)
+    logger.info(
+        "Evaluation complete: %d target rows, %d benchmark rows, %d figures",
+        len(headline),
+        len(benchmark),
+        len(figures),
+    )
     return headline
 
 

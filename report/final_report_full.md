@@ -231,16 +231,27 @@ trees. Selection used **pooled out-of-fold Spearman under `family_group`**, chos
 deliverable is a *ranking*: Spearman measures the ordering quality that Top-10 selection actually
 depends on, while RMSE would reward calibration that the downstream task never uses.
 
-Gradient boosting won both targets:
+Pearson is reported alongside Spearman so that poor calibration stays visible rather than hidden
+behind a good ranking: a model can order candidates perfectly while systematically mis-scaling the
+magnitudes, and only Pearson and RMSE would show it.
 
-| Target | ridge | random forest | gradient boosting |
-|---|---|---|---|
-| `stability_ddG` | 0.507 | 0.522 | **0.556** |
-| `functional_score` | 0.708 | 0.721 | **0.747** |
+Gradient boosting won both targets. Pooled out-of-fold under `family_group`:
+
+| Model | `stability_ddG` Spearman | Pearson | `functional_score` Spearman | Pearson |
+|---|---|---|---|---|
+| Ridge (regularized linear) | 0.507 | 0.513 | 0.708 | 0.730 |
+| Random forest | 0.522 | 0.548 | 0.721 | 0.776 |
+| **Gradient boosting** | **0.556** | **0.598** | **0.747** | **0.796** |
+
+The full 18-row benchmark — three models x three strategies x two targets, scored on MAE, RMSE,
+R², Pearson and Spearman — is written to `results/metrics/baseline_benchmark.md`.
 
 The ordering is consistent across all three strategies and both targets, so the choice is not an
 artefact of one split. Reproducibility is pinned by passing the seed explicitly to every
-stochastic component; two runs produce byte-identical out-of-fold predictions.
+stochastic component. Two runs in the same environment agree to floating-point tolerance
+(measured maximum out-of-fold difference 6.7e-16, metric difference 2.2e-16); they are not
+byte-identical, because threaded BLAS does not fix summation order. Metrics at reported
+precision, the selected models and the Top 10 are unchanged between runs.
 
 ---
 
@@ -250,10 +261,10 @@ stochastic component; two runs produce byte-identical out-of-fold predictions.
 
 Selected model, pooled out-of-fold under `family_group`:
 
-| Target | RMSE | R² | Spearman | Fold SD (Spearman) |
-|---|---|---|---|---|
-| `stability_ddG` | 0.426 | 0.341 | 0.556 | 0.052 |
-| `functional_score` | 0.069 | 0.634 | 0.747 | 0.031 |
+| Target | MAE | RMSE | R² | Pearson | Spearman | Fold SD (Spearman) |
+|---|---|---|---|---|---|---|
+| `stability_ddG` | 0.338 | 0.426 | 0.341 | 0.598 | 0.556 | 0.052 |
+| `functional_score` | 0.055 | 0.069 | 0.634 | 0.796 | 0.747 | 0.031 |
 
 **Functional retention is substantially more predictable than stability** (R² 0.63 vs 0.34). The
 practical consequence is important for how the Top 10 should be read: with RMSE 0.426 on a target
@@ -537,7 +548,8 @@ Two cautions follow from reading the five together:
 - **No feature attribution.** Section 7 reasons from input values and general biophysics, not from
   per-prediction attributions. SHAP values on the selected model would make those claims
   model-grounded, and this is the single cheapest improvement available.
-- **Results are environment-sensitive.** The pipeline is bit-reproducible for a fixed environment,
+- **Results are environment-sensitive.** Two runs in one environment agree to floating-point
+  tolerance (6.7e-16) rather than byte-for-byte,
   but a scikit-learn version change shifts predictions slightly and reorders the Top 10. The
   pinned versions and seed are recorded in `results/models/training_metadata.json`.
 

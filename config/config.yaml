@@ -41,6 +41,14 @@ files:
   cv_metrics_summary: cv_metrics_summary.csv        # pooled OOF + fold mean/std metrics
   model_selection: model_selection.json             # chosen model per target and why
   evaluation_markdown: evaluation_summary.md        # headline metrics + optimism gap
+  baseline_benchmark: baseline_benchmark.csv        # every model x target x strategy
+  baseline_benchmark_markdown: baseline_benchmark.md  # same, for the technical report
+  torch_oof_predictions: torch_oof_predictions.parquet  # neural-net out-of-fold predictions
+  torch_cv_metrics: torch_cv_metrics.csv            # neural-net pooled + per-fold metrics
+  torch_history: torch_training_history.csv         # loss per fold x epoch
+  torch_fold_summary: torch_fold_summary.csv        # early-stopping epoch per fold
+  torch_comparison: torch_vs_baselines.csv          # neural net against the sklearn baselines
+  torch_comparison_markdown: torch_vs_baselines.md  # same, for the technical report
   ablation_study: ablation_study.csv                # feature-subset ablation metrics
   ablation_markdown: ablation_study.md              # same, for the technical report
   # models_dir
@@ -85,7 +93,7 @@ validation:
   primary_strategy: family_group         # most realistic proxy for OOD candidates
   n_splits: 5                            # >= 2 and <= number of groups (7 families in training)
   shuffle: true                          # shuffle rows/groups before folding (seeded)
-  metrics: [rmse, mae, r2, spearman]     # any subset of these four
+  metrics: [rmse, mae, r2, pearson, spearman]   # any subset of these five
 
 # -----------------------------------------------------------------------------
 # Models
@@ -116,6 +124,45 @@ models:
   refit_on_full_data: true               # refit selected models on all labeled data for Phase 4
   save_fold_pipelines: true              # save the selected model's primary-strategy fold pipelines
                                          # (fold ensemble for prediction uncertainty in Phase 4)
+
+# -----------------------------------------------------------------------------
+# PyTorch multitask neural network (src/torch_model.py, src/train_torch.py)
+# One shared backbone feeding two regression heads, trained on both targets at
+# once. Runs on the same folds as the sklearn baselines, with the same
+# fold-local preprocessing, so its metrics are directly comparable.
+# -----------------------------------------------------------------------------
+torch:
+  # Shared backbone: one hidden layer per entry, each Linear -> BatchNorm ->
+  # activation -> Dropout. Widths taper so the backbone compresses toward the heads.
+  hidden_dims: [256, 128, 64]
+  activation: relu                     # relu | gelu
+  batch_norm: true
+  dropout: 0.25
+  # Per-head hidden width; null makes a head a single Linear layer.
+  head_hidden_dim: 32
+  optimizer:
+    learning_rate: 0.001
+    weight_decay: 0.0001               # L2, applied by Adam
+  batch_size: 64
+  max_epochs: 300
+  # Early stopping watches an inner split carved out of the TRAINING fold only.
+  # The outer validation fold is never seen during fitting, so out-of-fold
+  # metrics stay honest; see docstring in src/train_torch.py.
+  early_stopping:
+    inner_val_fraction: 0.2
+    patience: 25
+    min_delta: 0.0001
+  # Joint objective: alpha * MSE(stability) + beta * MSE(function).
+  # Rescaled to sum to 1, like prioritization.weights.
+  loss_weights:
+    stability: 0.5
+    function: 0.5
+  # stability_ddG is standardized on the training fold (kcal/mol, unbounded);
+  # functional_score is left on its native 0-1 scale and produced by a sigmoid head.
+  standardize_stability_target: true
+  # auto resolves to cpu: MPS/CUDA kernels are not bit-reproducible.
+  device: auto                         # auto | cpu | mps | cuda
+  save_fold_models: true
 
 # -----------------------------------------------------------------------------
 # Evaluation and visual quality control (src/evaluate.py)

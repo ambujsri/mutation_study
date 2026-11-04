@@ -3,7 +3,8 @@
 Runs the stages in dependency order, each of which is also runnable on its own
 as ``python -m src.<stage>``:
 
-    data_processing -> validation -> train -> evaluate -> predict -> ablation -> interpret
+    data_processing -> validation -> train -> evaluate -> train_torch
+                                  -> predict -> ablation -> interpret
 
 Every stage reads its inputs from, and writes its outputs to, the locations in
 ``config/config.yaml``; this module adds no behaviour of its own beyond
@@ -49,6 +50,18 @@ def _ablation_stage(cfg: dict[str, Any]) -> None:
     export_ablation(run_ablation(cfg), cfg)
 
 
+def _torch_stage(cfg: dict[str, Any]) -> None:
+    """Train and benchmark the multitask neural network.
+
+    PyTorch is imported here rather than at module scope so that the classical
+    pipeline still runs end to end in an environment without it: only this one
+    stage fails, and only when it is actually selected.
+    """
+    from src.train_torch import run_torch_training
+
+    run_torch_training(cfg)
+
+
 # Stage name -> entry point. Order is the dependency order: a stage may rely on
 # the artifacts of any stage above it, never below.
 STAGES: dict[str, Callable[[dict[str, Any]], Any]] = {
@@ -56,6 +69,7 @@ STAGES: dict[str, Callable[[dict[str, Any]], Any]] = {
     "validation": run_validation_harness,
     "train": run_training,
     "evaluate": run_evaluation,
+    "train_torch": _torch_stage,
     "predict": run_prediction,
     "ablation": _ablation_stage,
     "interpret": run_interpretation,

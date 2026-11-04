@@ -44,7 +44,15 @@ on macOS 26+, and the fix requires Python >= 3.11. See the note in
 
 ```bash
 python3.11 -m venv .venv && source .venv/bin/activate
-pip install -r requirements.txt          # or requirements-dev.txt for lint/type/test tooling
+pip install -r requirements-dev.txt      # runtime + lint/type/test/report tooling
+```
+
+Verify the interpreter before running anything — the pinned versions are what the published
+results were produced with, and a different scikit-learn silently changes them:
+
+```bash
+python -c "import sys, sklearn, numpy; print(sys.version.split()[0], sklearn.__version__, numpy.__version__)"
+# expected: 3.11.15 1.9.1 2.4.6
 ```
 
 ## How to run
@@ -82,7 +90,7 @@ Homebrew/PyPI build.
 Checks:
 
 ```bash
-python -m pytest -q        # 487 tests
+python -m pytest -q        # 498 tests
 python -m ruff check .
 python -m mypy src main.py
 ```
@@ -138,10 +146,19 @@ The gap between the two is reported explicitly as the **optimism gap**:
 Selected model for both targets: **gradient boosting**, by pooled Spearman under
 family-grouped CV.
 
-| Target | Pooled Spearman (family_group) |
-|---|---|
-| `stability_ddG` | 0.556 |
-| `functional_score` | 0.747 |
+| Target | MAE | RMSE | R² | Pearson | Spearman |
+|---|---|---|---|---|---|
+| `stability_ddG` | 0.338 | 0.426 | 0.341 | 0.598 | 0.556 |
+| `functional_score` | 0.055 | 0.069 | 0.634 | 0.796 | 0.747 |
+
+All three baselines on both targets under all three splits (18 rows, five metrics each) are in
+`results/metrics/baseline_benchmark.md`. Pooled Spearman under `family_group`:
+
+| Model | `stability_ddG` | `functional_score` |
+|---|---|---|
+| Ridge | 0.507 | 0.708 |
+| Random forest | 0.522 | 0.721 |
+| **Gradient boosting** | **0.556** | **0.747** |
 
 **Ablation — the headline scientific finding.** The 256-d embeddings contribute almost
 nothing, and on their own are worse than useless:
@@ -188,14 +205,14 @@ src/evaluate.py                 Metrics, optimism gap, figures, evaluation repor
 src/predict.py                  Ensemble inference, uncertainty, OOD flags, Top 10
 src/ablation.py                 Feature-subset ablation study
 src/interpret.py                Per-candidate scientific interpretation
-results/metrics/                CV metrics, OOF predictions, ablation, evaluation summary
+results/metrics/                CV metrics, OOF predictions, baseline benchmark, ablation
 results/figures/                Evaluation plots
 results/mutation_rankings/      Scored candidates, Top 10, candidate interpretation
 results/models/                 Fitted pipelines + training_metadata.json (provenance)
 report/final_report.md          Source for the 6-page technical report
 report/final_report.pdf         The report deliverable (built by report/build_pdf.py)
 report/final_report_full.md     Extended version: full derivations, all candidate write-ups
-tests/                          487 tests, mirroring src/
+tests/                          498 tests, mirroring src/
 main.py                         End-to-end orchestration
 docs/CODING_GUIDELINES.md       Standards every change must follow
 ```
@@ -209,7 +226,10 @@ Random seed: `20261102`, set once in `config/config.yaml` and threaded through e
 splitter, estimator and PCA.
 
 Results are reproducible for a fixed environment, but **not across library versions**.
-Re-running any stage with the pinned versions reproduces its outputs exactly; changing
+Re-running any stage with the pinned versions reproduces every reported metric, the selected
+models and the Top 10 exactly; the raw out-of-fold predictions agree to floating-point tolerance
+(measured maximum difference 6.7e-16) rather than byte-for-byte, because threaded BLAS does not
+fix summation order. Changing
 the scikit-learn pin shifts predictions slightly and reorders the Top 10 (overlap stays
 9/10). Model files in `results/models/` are joblib pickles and cannot be loaded by a
 different scikit-learn version, so changing that pin requires re-running training before

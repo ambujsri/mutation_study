@@ -193,6 +193,27 @@ class Scaler(str, Enum):
     NONE = "none"
 
 
+class TorchDevice(str, Enum):
+    """Compute device for the PyTorch model.
+
+    ``AUTO`` resolves to CPU: MPS and CUDA kernels are not bit-reproducible, and
+    this project treats reproducibility as the stronger requirement. Choose a
+    accelerator explicitly if throughput matters more on a given run.
+    """
+
+    AUTO = "auto"
+    CPU = "cpu"
+    MPS = "mps"
+    CUDA = "cuda"
+
+
+class Activation(str, Enum):
+    """Nonlinearity used between the shared backbone's hidden layers."""
+
+    RELU = "relu"
+    GELU = "gelu"
+
+
 class ReductionMethod(str, Enum):
     """Embedding dimensionality-reduction methods (fit inside each training fold)."""
 
@@ -205,12 +226,21 @@ class Metric(str, Enum):
     RMSE = "rmse"
     MAE = "mae"
     R2 = "r2"
+    # Pearson measures linear agreement, Spearman monotone agreement. Both are
+    # reported because a model can rank well while being poorly calibrated.
+    PEARSON = "pearson"
     SPEARMAN = "spearman"
 
 
 # Direction used for model selection: True if a larger value is better.
 METRIC_GREATER_IS_BETTER: Final = MappingProxyType(
-    {Metric.RMSE: False, Metric.MAE: False, Metric.R2: True, Metric.SPEARMAN: True}
+    {
+        Metric.RMSE: False,
+        Metric.MAE: False,
+        Metric.R2: True,
+        Metric.PEARSON: True,
+        Metric.SPEARMAN: True,
+    }
 )
 
 LOG_LEVELS: Final = ("DEBUG", "INFO", "WARNING", "ERROR", "CRITICAL")
@@ -241,6 +271,16 @@ CONFIG_BOUNDS: Final = MappingProxyType(
         "features.embedding_reduction.n_components": Bound(1, EMBEDDING_DIM, integer=True),
         "validation.n_splits": Bound(2, None, integer=True),
         "evaluation.figure_dpi": Bound(50, 600, integer=True),
+        "torch.dropout": Bound(0, 1),
+        "torch.batch_size": Bound(1, None, integer=True),
+        "torch.max_epochs": Bound(1, None, integer=True),
+        "torch.optimizer.learning_rate": Bound(0, 1, low_open=True),
+        "torch.optimizer.weight_decay": Bound(0, None),
+        "torch.early_stopping.inner_val_fraction": Bound(0, 1, low_open=True),
+        "torch.early_stopping.patience": Bound(1, None, integer=True),
+        "torch.early_stopping.min_delta": Bound(0, None),
+        "torch.loss_weights.stability": Bound(0, None),
+        "torch.loss_weights.function": Bound(0, None),
         "models.candidates.ridge.alpha": Bound(0, None, low_open=True),
         "models.candidates.random_forest.n_estimators": Bound(1, None, integer=True),
         "models.candidates.random_forest.min_samples_leaf": Bound(1, None, integer=True),
@@ -418,6 +458,32 @@ MATPLOTLIB_BACKEND: Final = "Agg"
 RESIDUAL_HIST_BINS: Final = 30
 FIGURE_XTICK_ROTATION: Final = 20
 
+# =============================================================================
+# PyTorch multitask model (assignment Task 4)
+# =============================================================================
+# Model name used in every metrics table, so the neural network lines up with
+# the sklearn baselines in the benchmark without a special case.
+TORCH_MODEL_NAME: Final = "multitask_nn"
+
+# Pipeline / artifact naming.
+TORCH_FINAL_MODEL_TEMPLATE: Final = "final__multitask_nn.pt"
+TORCH_FOLD_MODEL_TEMPLATE: Final = "{strategy}__fold{fold}__multitask_nn.pt"
+TORCH_PREPROCESSOR_TEMPLATE: Final = "{strategy}__fold{fold}__multitask_nn__preprocessor.joblib"
+TORCH_MODELS_SUBDIR: Final = "torch"
+TORCH_METADATA_FILE: Final = "torch_training_metadata.json"
+
+# Training-history schema (one row per fold x epoch).
+TORCH_COL_EPOCH: Final = "epoch"
+TORCH_COL_TRAIN_LOSS: Final = "train_loss"
+TORCH_COL_VAL_LOSS: Final = "val_loss"
+TORCH_COL_BEST_EPOCH: Final = "best_epoch"
+TORCH_COL_STOPPED_EPOCH: Final = "stopped_epoch"
+TORCH_COL_N_INNER_TRAIN: Final = "n_inner_train"
+TORCH_COL_N_INNER_VAL: Final = "n_inner_val"
+
+# Comparison table against the sklearn baselines.
+TORCH_COL_DELTA_PREFIX: Final = "delta_vs_best_baseline_"
+
 # Ablation report schema.
 ABL_COL_SUBSET: Final = "subset"
 ABL_COL_GROUPS: Final = "groups"
@@ -438,6 +504,7 @@ REQUIRED_CONFIG_SECTIONS: Final = (
     "quality",
     "validation",
     "models",
+    "torch",
     "evaluation",
     "ablation",
     "interpretation",

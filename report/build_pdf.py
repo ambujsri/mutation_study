@@ -60,7 +60,7 @@ CODE_BG = colors.HexColor("#f2f2f4")
 TEXT_WIDTH = A4[0] - 2 * PAGE_MARGIN
 # Figures are wide and short, so printing them at the full text width wastes a
 # third of a page and makes the type inside them larger than the body text.
-MAX_IMAGE_WIDTH = TEXT_WIDTH * 0.72
+MAX_IMAGE_WIDTH = TEXT_WIDTH * 0.64
 
 # Markdown constructs this renderer understands, in match order.
 HEADING = re.compile(r"^(#{1,6})\s+(.*)$")

@@ -33,6 +33,8 @@ TEST_N_SPLITS: int = 2  # synthetic data has only 2 families
 TEST_N_COMPONENTS: int = 2
 TEST_TOP_K: int = 4
 TEST_N_CANDIDATES: int = 2  # candidates written up by the interpretation stage
+TEST_MAX_EPOCHS: int = 3    # the end-to-end test checks wiring, not convergence
+TEST_PATIENCE: int = 2
 
 
 # =============================================================================
@@ -59,6 +61,14 @@ def pipeline_cfg(cfg: dict[str, Any], raw_files: dict[str, Path]) -> dict[str, A
     cfg["prioritization"]["top_k"] = TEST_TOP_K
     cfg["prioritization"]["min_fold_models"] = TEST_N_SPLITS
     cfg["interpretation"]["n_candidates"] = TEST_N_CANDIDATES
+    # The neural network is trained for real in the end-to-end test, so keep it
+    # tiny: the test asserts that the stage runs and writes its artifacts, not
+    # that a 24-row synthetic fit is any good.
+    cfg["torch"]["hidden_dims"] = [8]
+    cfg["torch"]["head_hidden_dim"] = None
+    cfg["torch"]["batch_size"] = 8
+    cfg["torch"]["max_epochs"] = TEST_MAX_EPOCHS
+    cfg["torch"]["early_stopping"]["patience"] = TEST_PATIENCE
     validate_config(cfg)
     return cfg
 
@@ -78,6 +88,7 @@ def test_stage_registry_is_in_dependency_order() -> None:
         "validation",
         "train",
         "evaluate",
+        "train_torch",
         "predict",
         "ablation",
         "interpret",
@@ -96,7 +107,9 @@ def test_requested_stages_are_reordered_canonically() -> None:
 
 def test_from_runs_the_stage_and_everything_after() -> None:
     """``--from`` resumes a pipeline without redoing the stages that have not changed."""
-    assert main.resolve_stages(None, "evaluate") == ["evaluate", "predict", "ablation", "interpret"]
+    assert main.resolve_stages(None, "evaluate") == [
+        "evaluate", "train_torch", "predict", "ablation", "interpret",
+    ]
 
 
 def test_from_the_first_stage_is_the_whole_pipeline() -> None:
@@ -173,6 +186,11 @@ def test_full_pipeline_produces_every_deliverable(pipeline_cfg: dict[str, Any]) 
             "evaluation_markdown",
             "ablation_study",
             "ablation_markdown",
+            "torch_cv_metrics",
+            "torch_history",
+            "torch_fold_summary",
+            "torch_comparison",
+            "torch_comparison_markdown",
         ],
         "models_dir": ["training_metadata"],
         "figures_dir": list(const.FIGURE_FILE_KEYS),

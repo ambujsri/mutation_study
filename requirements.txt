@@ -19,6 +19,8 @@ scipy==1.17.1
 PyYAML==6.0.3
 joblib==1.6.0
 tabulate==0.10.0        # required by pandas .to_markdown() in src/predict.py
+torch==2.15.0           # multitask neural network (src/torch_model.py, src/train_torch.py);
+                        # imported lazily by main.py, so the classical pipeline
+                        # still runs end to end without it installed
 matplotlib==3.11.2      # evaluation figures in src/evaluate.py
 seaborn==0.13.2
-reportlab==5.0.1        # renders report/final_report.md to final_report.pdf
