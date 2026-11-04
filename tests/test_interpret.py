@@ -291,7 +291,7 @@ def test_mutation_label_formats_substitution(interpret_cfg: dict[str, Any], scor
 # =============================================================================
 def test_run_interpretation_requires_phase4(interpret_cfg: dict[str, Any], tmp_path: Path) -> None:
     """Without Phase 4 output the error names the command to run."""
-    interpret_cfg["paths"]["reports_dir"] = str(tmp_path / "empty")
+    interpret_cfg["paths"]["rankings_dir"] = str(tmp_path / "empty")
 
     with pytest.raises(FileNotFoundError, match="src.predict"):
         ip.run_interpretation(interpret_cfg)
@@ -299,7 +299,7 @@ def test_run_interpretation_requires_phase4(interpret_cfg: dict[str, Any], tmp_p
 
 def test_run_interpretation_writes_markdown(interpret_cfg: dict[str, Any], scored: pd.DataFrame) -> None:
     """The document is written where configured and covers the selected candidates."""
-    reports = Path(interpret_cfg["paths"]["reports_dir"])
+    reports = Path(interpret_cfg["paths"]["rankings_dir"])
     reports.mkdir(parents=True, exist_ok=True)
     scored.head(5).to_csv(reports / interpret_cfg["files"]["top_candidates"], index=False)
     scored.to_csv(reports / interpret_cfg["files"]["all_predictions"], index=False)

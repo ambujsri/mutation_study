@@ -19,8 +19,8 @@ import numpy as np
 import pandas as pd
 import pytest
 
+from src import data_processing as pp
 from src import predict as pr
-from src import preprocess as pp
 from src import train as tr
 from src.common import constants as const
 from src.common.config import validate_config
@@ -461,7 +461,7 @@ def test_run_prediction_writes_all_artifacts(phase4_cfg: dict[str, Any]) -> None
     """All candidates, the Top-K CSV and the Markdown report are written and consistent."""
     scored, report = pr.run_prediction(phase4_cfg)
 
-    reports_dir = Path(phase4_cfg["paths"]["reports_dir"])
+    reports_dir = Path(phase4_cfg["paths"]["rankings_dir"])
     all_path = reports_dir / phase4_cfg["files"]["all_predictions"]
     top_path = reports_dir / phase4_cfg["files"]["top_candidates"]
     markdown_path = reports_dir / phase4_cfg["files"]["top_candidates_markdown"]

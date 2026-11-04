@@ -8,7 +8,7 @@
 #   zero-fill section type, but offset field is not zero
 # scipy >= 1.16 fixes this but requires Python >= 3.11.
 #
-# Model artifacts in outputs/models/ are pickled by joblib and are NOT portable
+# Model artifacts in results/models/ are pickled by joblib and are NOT portable
 # across scikit-learn versions. Changing the scikit-learn pin below requires
 # re-running `python -m src.train` before `python -m src.predict`.
 numpy==2.4.6
@@ -19,5 +19,6 @@ scipy==1.17.1
 PyYAML==6.0.3
 joblib==1.6.0
 tabulate==0.10.0        # required by pandas .to_markdown() in src/predict.py
-matplotlib==3.11.2
+matplotlib==3.11.2      # evaluation figures in src/evaluate.py
 seaborn==0.13.2
+reportlab==5.0.1        # renders report/final_report.md to final_report.pdf

@@ -38,7 +38,9 @@ import pandas as pd
 from src.common import constants as const
 from src.common.config import DEFAULT_CONFIG_PATH, load_config, resolve_path, setup_logging
 from src.common.io import write_table
-from src.train import FeatureSet, compute_metrics, cross_validate_model, load_training_data
+from src.evaluate import compute_metrics
+from src.model import FeatureSet
+from src.train import cross_validate_model, load_training_data
 from src.validation import generate_folds
 
 logger = logging.getLogger(__name__)
@@ -270,7 +272,7 @@ def export_artifacts(table: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Path
     Returns:
         Mapping of artifact name to written path.
     """
-    paths = {key: resolve_path(cfg, "reports_dir", key) for key in ("ablation_study", "ablation_markdown")}
+    paths = {key: resolve_path(cfg, "metrics_dir", key) for key in ("ablation_study", "ablation_markdown")}
     write_table(table, paths["ablation_study"])
     paths["ablation_markdown"].parent.mkdir(parents=True, exist_ok=True)
     paths["ablation_markdown"].write_text(to_markdown(table, cfg), encoding=const.CONFIG_ENCODING)

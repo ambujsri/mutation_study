@@ -16,7 +16,8 @@ import pandas as pd
 import pytest
 
 from src import ablation as ab
-from src import preprocess as pp
+from src import data_processing as pp
+from src import model as md
 from src import train as tr
 from src.common import constants as const
 from src.common.config import validate_config
@@ -53,7 +54,7 @@ def ablation_cfg(cfg: dict[str, Any], raw_files: dict[str, Path]) -> dict[str, A
 
 
 @pytest.fixture()
-def manifest_features(ablation_cfg: dict[str, Any]) -> tr.FeatureSet:
+def manifest_features(ablation_cfg: dict[str, Any]) -> md.FeatureSet:
     """Feature lists from the synthetic Phase 1 run."""
     return tr.load_training_data(ablation_cfg)[1]
 
@@ -61,7 +62,7 @@ def manifest_features(ablation_cfg: dict[str, Any]) -> tr.FeatureSet:
 # =============================================================================
 # Subset resolution
 # =============================================================================
-def test_feature_groups_cover_manifest_tabular(manifest_features: tr.FeatureSet) -> None:
+def test_feature_groups_cover_manifest_tabular(manifest_features: md.FeatureSet) -> None:
     """Every tabular feature Phase 1 produces belongs to exactly one declared group."""
     grouped = [
         column
@@ -73,7 +74,7 @@ def test_feature_groups_cover_manifest_tabular(manifest_features: tr.FeatureSet)
     assert set(manifest_features.tabular) <= set(grouped), "a manifest feature is in no group"
 
 
-def test_resolve_subset_splits_tabular_and_embedding(manifest_features: tr.FeatureSet) -> None:
+def test_resolve_subset_splits_tabular_and_embedding(manifest_features: md.FeatureSet) -> None:
     """Embedding columns land in the embedding block; everything else is tabular."""
     subset = ab.resolve_subset(
         "mixed", [const.GROUP_PHYSICOCHEMICAL, const.GROUP_EMBEDDINGS], manifest_features
@@ -84,14 +85,14 @@ def test_resolve_subset_splits_tabular_and_embedding(manifest_features: tr.Featu
     assert not [c for c in subset.features.tabular if c.startswith(const.EMBEDDING_PREFIX)]
 
 
-def test_resolve_subset_preserves_manifest_order(manifest_features: tr.FeatureSet) -> None:
+def test_resolve_subset_preserves_manifest_order(manifest_features: md.FeatureSet) -> None:
     """Column order follows the manifest, so runs are deterministic."""
     subset = ab.resolve_subset("all_tabular", [g for g in const.FEATURE_GROUPS], manifest_features)
 
     assert subset.features.tabular == manifest_features.tabular
 
 
-def test_resolve_subset_skips_columns_absent_from_manifest(manifest_features: tr.FeatureSet) -> None:
+def test_resolve_subset_skips_columns_absent_from_manifest(manifest_features: md.FeatureSet) -> None:
     """A group listing optional columns (e.g. the ordinal SS encoding) resolves to what exists."""
     subset = ab.resolve_subset("structural", [const.GROUP_STRUCTURAL], manifest_features)
 
@@ -100,16 +101,16 @@ def test_resolve_subset_skips_columns_absent_from_manifest(manifest_features: tr
     assert const.COL_CONSERVATION in subset.features.tabular
 
 
-def test_resolve_subset_empty_raises(manifest_features: tr.FeatureSet) -> None:
+def test_resolve_subset_empty_raises(manifest_features: md.FeatureSet) -> None:
     """A subset that resolves to nothing is an error, not an empty silent run."""
-    empty = tr.FeatureSet([], [])
+    empty = md.FeatureSet([], [])
 
     with pytest.raises(ValueError, match="resolves to no available columns"):
         ab.resolve_subset("nothing", [const.GROUP_PHYSICOCHEMICAL], empty)
 
 
 def test_build_subsets_returns_all_configured(
-    ablation_cfg: dict[str, Any], manifest_features: tr.FeatureSet
+    ablation_cfg: dict[str, Any], manifest_features: md.FeatureSet
 ) -> None:
     """Every configured subset is resolved, in config order."""
     subsets = ab.build_subsets(ablation_cfg, manifest_features)
@@ -154,35 +155,35 @@ def test_resolve_models_reads_phase3_selection(ablation_cfg: dict[str, Any]) -> 
 # Leakage guarantee for single-block subsets
 # =============================================================================
 def test_embeddings_only_subset_builds_single_block_pipeline(
-    ablation_cfg: dict[str, Any], manifest_features: tr.FeatureSet
+    ablation_cfg: dict[str, Any], manifest_features: md.FeatureSet
 ) -> None:
     """A subset with no tabular columns omits that block instead of fitting on zero features."""
     subset = ab.resolve_subset("emb", [const.GROUP_EMBEDDINGS], manifest_features)
 
-    preprocessor = tr.build_preprocessor(ablation_cfg, subset.features)
+    preprocessor = md.build_preprocessor(ablation_cfg, subset.features)
 
     assert [name for name, _, _ in preprocessor.transformers] == [const.BLOCK_EMBEDDING]
 
 
 def test_tabular_only_subset_omits_embedding_block(
-    ablation_cfg: dict[str, Any], manifest_features: tr.FeatureSet
+    ablation_cfg: dict[str, Any], manifest_features: md.FeatureSet
 ) -> None:
     """A subset without embeddings carries no PCA step at all."""
     subset = ab.resolve_subset("tab", [const.GROUP_PHYSICOCHEMICAL], manifest_features)
 
-    preprocessor = tr.build_preprocessor(ablation_cfg, subset.features)
+    preprocessor = md.build_preprocessor(ablation_cfg, subset.features)
 
     assert [name for name, _, _ in preprocessor.transformers] == [const.BLOCK_TABULAR]
 
 
 def test_subset_model_sees_only_its_columns(
-    ablation_cfg: dict[str, Any], manifest_features: tr.FeatureSet
+    ablation_cfg: dict[str, Any], manifest_features: md.FeatureSet
 ) -> None:
     """The fitted estimator's input width matches the subset, proving restriction is real."""
     df = tr.load_training_data(ablation_cfg)[0]
     subset = ab.resolve_subset("phys", [const.GROUP_PHYSICOCHEMICAL], manifest_features)
 
-    pipeline = tr.build_pipeline(ablation_cfg, const.ModelName.RIDGE, subset.features)
+    pipeline = md.build_pipeline(ablation_cfg, const.ModelName.RIDGE, subset.features)
     pipeline.fit(df[subset.features.all], df[const.TARGET_STABILITY])
 
     assert pipeline.named_steps[const.STEP_MODEL].n_features_in_ == len(subset.features.tabular)

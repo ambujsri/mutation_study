@@ -19,14 +19,11 @@ import joblib
 import numpy as np
 import pandas as pd
 import pytest
-from sklearn.base import BaseEstimator
-from sklearn.decomposition import PCA
-from sklearn.ensemble import GradientBoostingRegressor, RandomForestRegressor
-from sklearn.linear_model import Ridge
 from sklearn.pipeline import Pipeline
-from sklearn.preprocessing import RobustScaler, StandardScaler
 
-from src import preprocess as pp
+from src import data_processing as pp
+from src import evaluate as ev
+from src import model as md
 from src import train as tr
 from src.common import constants as const
 from src.common.config import validate_config
@@ -73,7 +70,7 @@ def train_cfg(cfg: dict[str, Any], raw_files: dict[str, Path]) -> dict[str, Any]
 
 
 @pytest.fixture()
-def data(train_cfg: dict[str, Any]) -> tuple[pd.DataFrame, tr.FeatureSet]:
+def data(train_cfg: dict[str, Any]) -> tuple[pd.DataFrame, md.FeatureSet]:
     """Processed training table and feature lists, as Phase 3 loads them."""
     return tr.load_training_data(train_cfg)
 
@@ -94,7 +91,7 @@ def block(pipeline: Pipeline, name: str) -> Pipeline:
 # =============================================================================
 # Data loading
 # =============================================================================
-def test_load_training_data_returns_manifest_features(data: tuple[pd.DataFrame, tr.FeatureSet]) -> None:
+def test_load_training_data_returns_manifest_features(data: tuple[pd.DataFrame, md.FeatureSet]) -> None:
     """Features come from the Phase 1 manifest; embeddings are the 256 constant columns."""
     df, features = data
 
@@ -122,99 +119,10 @@ def test_load_training_data_detects_missing_columns(train_cfg: dict[str, Any]) -
 
 
 # =============================================================================
-# Pipeline construction
+# Fold-level diagnostics
 # =============================================================================
-def test_pipeline_structure(train_cfg: dict[str, Any], data: tuple[pd.DataFrame, tr.FeatureSet]) -> None:
-    """Pipeline = preprocess(tabular: impute→scale, embedding: impute→scale→PCA) → model."""
-    _, features = data
-
-    pipeline = tr.build_pipeline(train_cfg, const.ModelName.RIDGE, features)
-
-    assert [name for name, _ in pipeline.steps] == [const.STEP_PREPROCESS, const.STEP_MODEL]
-    transformers = {
-        name: (steps, cols) for name, steps, cols in pipeline.named_steps[const.STEP_PREPROCESS].transformers
-    }
-    tab_steps, tab_cols = transformers[const.BLOCK_TABULAR]
-    emb_steps, emb_cols = transformers[const.BLOCK_EMBEDDING]
-    assert tab_cols == features.tabular
-    assert emb_cols == features.embedding
-    assert list(tab_steps.named_steps) == [const.STEP_IMPUTE, const.STEP_SCALE]
-    assert list(emb_steps.named_steps) == [const.STEP_IMPUTE, const.STEP_SCALE, const.STEP_REDUCE]
-    pca = emb_steps.named_steps[const.STEP_REDUCE]
-    assert isinstance(pca, PCA)
-    assert pca.n_components == TEST_N_COMPONENTS
-    assert pca.random_state == train_cfg["project"]["random_seed"]
-
-
-@pytest.mark.parametrize(
-    ("scaler", "expected"),
-    [(const.Scaler.STANDARD, StandardScaler), (const.Scaler.ROBUST, RobustScaler), (const.Scaler.NONE, None)],
-)
-def test_scaler_follows_config(
-    train_cfg: dict[str, Any],
-    data: tuple[pd.DataFrame, tr.FeatureSet],
-    scaler: const.Scaler,
-    expected: type | None,
-) -> None:
-    """The configured scaler (or none) is used in both feature blocks."""
-    train_cfg["models"]["scaler"] = scaler.value
-
-    preprocessor = tr.build_preprocessor(train_cfg, data[1])
-
-    for _, steps, _ in preprocessor.transformers:
-        if expected is None:
-            assert const.STEP_SCALE not in steps.named_steps
-        else:
-            assert isinstance(steps.named_steps[const.STEP_SCALE], expected)
-
-
-def test_embedding_reduction_can_be_disabled(
-    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, tr.FeatureSet]
-) -> None:
-    """With reduction disabled the full embedding block is passed to the model."""
-    df, features = data
-    train_cfg["features"]["embedding_reduction"]["enabled"] = False
-
-    pipeline = tr.build_pipeline(train_cfg, const.ModelName.RIDGE, features)
-    pipeline.fit(df[features.all], df[const.TARGET_STABILITY])
-
-    assert const.STEP_REDUCE not in block(pipeline, const.BLOCK_EMBEDDING).named_steps
-    assert pipeline.named_steps[const.STEP_MODEL].n_features_in_ == len(features.all)
-
-
-def test_reduced_feature_count(train_cfg: dict[str, Any], data: tuple[pd.DataFrame, tr.FeatureSet]) -> None:
-    """With PCA on, the model sees tabular features plus ``n_components`` embedding components."""
-    df, features = data
-
-    pipeline = tr.build_pipeline(train_cfg, const.ModelName.RIDGE, features)
-    pipeline.fit(df[features.all], df[const.TARGET_STABILITY])
-
-    assert pipeline.named_steps[const.STEP_MODEL].n_features_in_ == len(features.tabular) + TEST_N_COMPONENTS
-
-
-@pytest.mark.parametrize(
-    ("model", "cls"),
-    [
-        (const.ModelName.RIDGE, Ridge),
-        (const.ModelName.RANDOM_FOREST, RandomForestRegressor),
-        (const.ModelName.GRADIENT_BOOSTING, GradientBoostingRegressor),
-    ],
-)
-def test_build_estimator_applies_params_and_seed(
-    model: const.ModelName, cls: type[BaseEstimator], seed: int
-) -> None:
-    """Config hyperparameters are passed through and the project seed is set where supported."""
-    estimator = tr.build_estimator(model, SMALL_MODELS[model.value], seed)
-
-    assert isinstance(estimator, cls)
-    params = estimator.get_params()
-    for key, value in SMALL_MODELS[model.value].items():
-        assert params[key] == value
-    assert params["random_state"] == seed
-
-
 def test_low_protein_count_warns(
-    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, tr.FeatureSet], caplog: pytest.LogCaptureFixture
+    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, md.FeatureSet], caplog: pytest.LogCaptureFixture
 ) -> None:
     """PCA components beyond the number of distinct training proteins are flagged as uninformative."""
     df, features = data
@@ -233,16 +141,12 @@ def test_low_protein_count_warns(
     assert any("distinct training proteins" in r.getMessage() for r in caplog.records)
 
 
-def test_every_registered_model_has_config_choice() -> None:
-    """The registry and the ``ModelName`` enum list exactly the same models."""
-    assert set(tr.MODEL_REGISTRY) == set(const.ModelName)
-
 
 # =============================================================================
 # Leakage prevention (the critical guarantees)
 # =============================================================================
 def test_fold_transformers_fit_on_training_rows_only(
-    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, tr.FeatureSet]
+    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, md.FeatureSet]
 ) -> None:
     """Imputer, scaler and PCA statistics equal those of the training fold, not of all rows."""
     df, features = data
@@ -272,7 +176,7 @@ def test_fold_transformers_fit_on_training_rows_only(
 
 
 def test_validation_rows_cannot_influence_fitted_pipeline(
-    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, tr.FeatureSet]
+    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, md.FeatureSet]
 ) -> None:
     """Corrupting validation features and targets leaves every fitted transformer and model unchanged."""
     df, features = data
@@ -306,7 +210,7 @@ def test_validation_rows_cannot_influence_fitted_pipeline(
 
 
 def test_each_fold_gets_a_fresh_pipeline(
-    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, tr.FeatureSet]
+    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, md.FeatureSet]
 ) -> None:
     """Folds never share a fitted object (no state carried from one fold to the next)."""
     df, features = data
@@ -323,7 +227,7 @@ def test_each_fold_gets_a_fresh_pipeline(
 # Out-of-fold predictions
 # =============================================================================
 def test_oof_predictions_cover_every_row_once(
-    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, tr.FeatureSet]
+    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, md.FeatureSet]
 ) -> None:
     """Per model and target, each labeled mutation gets one OOF prediction with its true label."""
     df, features = data
@@ -341,50 +245,20 @@ def test_oof_predictions_cover_every_row_once(
 
 
 # =============================================================================
-# Metrics
-# =============================================================================
-def test_compute_metrics_known_values() -> None:
-    """Hand-computed example: one error of 1 on four points."""
-    y_true = np.array([1.0, 2.0, 3.0, 4.0])
-    y_pred = np.array([1.0, 2.0, 3.0, 5.0])
-
-    scores = tr.compute_metrics(y_true, y_pred, list(const.Metric))
-
-    assert scores[const.Metric.RMSE.value] == pytest.approx(0.5)
-    assert scores[const.Metric.MAE.value] == pytest.approx(0.25)
-    assert scores[const.Metric.R2.value] == pytest.approx(1 - 1 / 5)
-    assert scores[const.Metric.SPEARMAN.value] == pytest.approx(1.0)
-
-
-def test_compute_metrics_constant_prediction_gives_nan_spearman() -> None:
-    """Rank correlation is undefined for constant predictions and is reported as NaN, not 0."""
-    scores = tr.compute_metrics(np.array([1.0, 2.0, 3.0]), np.array([2.0, 2.0, 2.0]), [const.Metric.SPEARMAN])
-
-    assert np.isnan(scores[const.Metric.SPEARMAN.value])
-
-
-def test_compute_metrics_returns_only_requested() -> None:
-    """Only configured metrics are computed."""
-    scores = tr.compute_metrics(np.array([1.0, 2.0]), np.array([1.0, 2.5]), [const.Metric.MAE])
-
-    assert list(scores) == [const.Metric.MAE.value]
-
-
-# =============================================================================
-# Cross-validation, summary and selection
+# Cross-validation grid and the train -> evaluate seam
 # =============================================================================
 @pytest.fixture()
 def cv_run(
-    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, tr.FeatureSet]
-) -> tuple[tr.CVResults, pd.DataFrame]:
+    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, md.FeatureSet]
+) -> tuple[md.CVResults, pd.DataFrame]:
     """Cross-validation results and metric summary for all strategies, models and targets."""
     df, features = data
     splits, _ = build_cv_splits(df, train_cfg)
     results = tr.run_cross_validation(df, splits, train_cfg, features)
-    return results, tr.summarize_metrics(results, train_cfg)
+    return results, ev.summarize_metrics(results, train_cfg)
 
 
-def test_cv_covers_full_grid(cv_run: tuple[tr.CVResults, pd.DataFrame], train_cfg: dict[str, Any]) -> None:
+def test_cv_covers_full_grid(cv_run: tuple[md.CVResults, pd.DataFrame], train_cfg: dict[str, Any]) -> None:
     """Every strategy × model × target × fold is evaluated."""
     results, summary = cv_run
     n_strategies = len(train_cfg["validation"]["strategies"])
@@ -396,9 +270,9 @@ def test_cv_covers_full_grid(cv_run: tuple[tr.CVResults, pd.DataFrame], train_cf
 
 
 def test_summary_pooled_and_fold_metrics_are_consistent(
-    cv_run: tuple[tr.CVResults, pd.DataFrame],
+    cv_run: tuple[md.CVResults, pd.DataFrame],
     train_cfg: dict[str, Any],
-    data: tuple[pd.DataFrame, tr.FeatureSet],
+    data: tuple[pd.DataFrame, md.FeatureSet],
 ) -> None:
     """Pooled metrics recompute from OOF rows; fold means recompute from fold metrics."""
     results, summary = cv_run
@@ -409,7 +283,7 @@ def test_summary_pooled_and_fold_metrics_are_consistent(
         mask = (results.oof[keys] == row[keys].to_numpy()).all(axis=1)
         oof = results.oof[mask]
         assert row[const.COL_N_SAMPLES] == len(data[0])
-        expected = tr.compute_metrics(
+        expected = ev.compute_metrics(
             oof[const.COL_Y_TRUE].to_numpy(), oof[const.COL_Y_PRED].to_numpy(), metrics
         )
         fold_rows = results.fold_metrics[(results.fold_metrics[keys] == row[keys].to_numpy()).all(axis=1)]
@@ -423,7 +297,7 @@ def test_summary_pooled_and_fold_metrics_are_consistent(
 
 
 def test_fold_pipelines_kept_for_primary_strategy_only(
-    cv_run: tuple[tr.CVResults, pd.DataFrame], train_cfg: dict[str, Any]
+    cv_run: tuple[md.CVResults, pd.DataFrame], train_cfg: dict[str, Any]
 ) -> None:
     """Only primary-strategy fold pipelines are retained, one per model × target × fold."""
     results, _ = cv_run
@@ -434,103 +308,18 @@ def test_fold_pipelines_kept_for_primary_strategy_only(
     )
 
 
-def make_summary(values: dict[tuple[str, str], float], metric: const.Metric) -> pd.DataFrame:
-    """Build a minimal metrics summary from ``{(strategy, model): value}`` for both targets."""
-    rows = [
-        {
-            const.CV_COL_STRATEGY: strategy,
-            const.COL_MODEL: model,
-            const.COL_TARGET: target,
-            f"{const.POOLED_PREFIX}{metric.value}": value,
-        }
-        for target in const.TARGETS.values()
-        for (strategy, model), value in values.items()
-    ]
-    return pd.DataFrame(rows)
-
-
-@pytest.mark.parametrize(
-    ("metric", "values", "expected"),
-    [
-        (
-            const.Metric.SPEARMAN,
-            {"ridge": 0.4, "random_forest": 0.7, "gradient_boosting": 0.6},
-            "random_forest",
-        ),
-        (const.Metric.R2, {"ridge": 0.4, "random_forest": 0.1, "gradient_boosting": 0.3}, "ridge"),
-        (
-            const.Metric.RMSE,
-            {"ridge": 0.4, "random_forest": 0.5, "gradient_boosting": 0.3},
-            "gradient_boosting",
-        ),
-        (const.Metric.MAE, {"ridge": 0.2, "random_forest": 0.5, "gradient_boosting": 0.3}, "ridge"),
-        (
-            const.Metric.SPEARMAN,
-            {"ridge": 0.6, "random_forest": 0.6, "gradient_boosting": 0.5},
-            "ridge",
-        ),  # tie
-        (
-            const.Metric.SPEARMAN,
-            {"ridge": float("nan"), "random_forest": 0.1, "gradient_boosting": 0.0},
-            "random_forest",
-        ),
-    ],
-)
-def test_select_best_models_respects_metric_direction(
-    train_cfg: dict[str, Any], metric: const.Metric, values: dict[str, float], expected: str
-) -> None:
-    """Higher wins for r2/spearman, lower for rmse/mae; ties go to config order; NaN is skipped."""
-    primary = train_cfg["validation"]["primary_strategy"]
-    train_cfg["models"]["selection_metric"] = metric.value
-    summary = make_summary({(primary, m): v for m, v in values.items()}, metric)
-
-    selection = tr.select_best_models(summary, train_cfg)
-
-    for target in const.TARGETS.values():
-        assert selection[target][const.COL_MODEL] == expected
-        assert selection[target][const.CV_COL_STRATEGY] == primary
-
-
-def test_select_best_models_ignores_non_primary_strategies(train_cfg: dict[str, Any]) -> None:
-    """A model that only looks best under the (optimistic) random split is not selected."""
-    primary = train_cfg["validation"]["primary_strategy"]
-    train_cfg["models"]["selection_metric"] = const.Metric.SPEARMAN.value
-    summary = make_summary(
-        {
-            (const.SplitStrategy.RANDOM.value, "ridge"): 0.99,
-            (primary, "ridge"): 0.2,
-            (primary, "random_forest"): 0.5,
-        },
-        const.Metric.SPEARMAN,
-    )
-
-    selection = tr.select_best_models(summary, train_cfg)
-
-    assert selection[const.TARGET_STABILITY][const.COL_MODEL] == "random_forest"
-
-
-def test_select_best_models_raises_without_finite_scores(train_cfg: dict[str, Any]) -> None:
-    """If every candidate scored NaN there is nothing defensible to select."""
-    primary = train_cfg["validation"]["primary_strategy"]
-    train_cfg["models"]["selection_metric"] = const.Metric.SPEARMAN.value
-    summary = make_summary({(primary, "ridge"): float("nan")}, const.Metric.SPEARMAN)
-
-    with pytest.raises(ValueError, match="No model has a finite"):
-        tr.select_best_models(summary, train_cfg)
-
-
 # =============================================================================
 # End-to-end
 # =============================================================================
 def test_run_training_writes_all_artifacts(
-    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, tr.FeatureSet]
+    train_cfg: dict[str, Any], data: tuple[pd.DataFrame, md.FeatureSet]
 ) -> None:
     """Reports, final models, selected-model fold pipelines and metadata are written and usable."""
     df, features = data
 
     _, summary, selection = tr.run_training(train_cfg)
 
-    reports = Path(train_cfg["paths"]["reports_dir"])
+    reports = Path(train_cfg["paths"]["metrics_dir"])
     models = Path(train_cfg["paths"]["models_dir"])
     for key in ("oof_predictions", "cv_fold_metrics", "cv_metrics_summary", "model_selection"):
         assert (reports / train_cfg["files"][key]).is_file()

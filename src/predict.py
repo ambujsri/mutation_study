@@ -55,7 +55,7 @@ from sklearn.pipeline import Pipeline
 from src.common import constants as const
 from src.common.config import DEFAULT_CONFIG_PATH, load_config, resolve_path, setup_logging
 from src.common.io import read_table, write_table
-from src.train import FeatureSet
+from src.model import FeatureSet
 
 logger = logging.getLogger(__name__)
 
@@ -431,7 +431,7 @@ def export_artifacts(
         Mapping of artifact name to written path.
     """
     paths = {
-        key: resolve_path(cfg, "reports_dir", key)
+        key: resolve_path(cfg, "rankings_dir", key)
         for key in ("all_predictions", "top_candidates", "top_candidates_markdown")
     }
     reportable = scored.drop(columns=[c for c in scored.columns if c.startswith(const.EMBEDDING_PREFIX)])

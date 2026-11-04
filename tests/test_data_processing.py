@@ -1,4 +1,4 @@
-"""Unit and integration tests for ``src.preprocess``.
+"""Unit and integration tests for ``src.data_processing``.
 
 Covers every public step of Phase 1 against small synthetic tables built in
 ``conftest.py``: schema validation, the embedding merge, anomaly detection and
@@ -18,7 +18,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from src import preprocess as pp
+from src import data_processing as pp
 from src.common import constants as const
 
 ONEHOT_COLUMNS: list[str] = [f"{const.SS_ONEHOT_PREFIX}_{code}" for code in const.SS_CATEGORIES]

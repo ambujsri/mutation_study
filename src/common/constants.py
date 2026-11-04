@@ -240,6 +240,7 @@ CONFIG_BOUNDS: Final = MappingProxyType(
         "project.random_seed": Bound(0, 2**32 - 1, integer=True),
         "features.embedding_reduction.n_components": Bound(1, EMBEDDING_DIM, integer=True),
         "validation.n_splits": Bound(2, None, integer=True),
+        "evaluation.figure_dpi": Bound(50, 600, integer=True),
         "models.candidates.ridge.alpha": Bound(0, None, low_open=True),
         "models.candidates.random_forest.n_estimators": Bound(1, None, integer=True),
         "models.candidates.random_forest.min_samples_leaf": Bound(1, None, integer=True),
@@ -402,6 +403,21 @@ FEATURE_GROUPS: Final = MappingProxyType(
     }
 )
 
+# =============================================================================
+# Evaluation report and figures
+# =============================================================================
+EVAL_COL_METRIC: Final = "metric"
+EVAL_COL_OPTIMISM_GAP: Final = "optimism_gap"  # random-split score minus grouped-split score
+
+# Figure artifacts, keyed by their entry in the config `files` section. Adding a
+# figure means adding its key here and a filename in config.yaml.
+FIGURE_FILE_KEYS: Final = ("fig_pred_vs_actual", "fig_residuals", "fig_strategy_comparison")
+# Non-interactive backend: figures are written to disk, never displayed, so the
+# pipeline runs identically on a headless machine.
+MATPLOTLIB_BACKEND: Final = "Agg"
+RESIDUAL_HIST_BINS: Final = 30
+FIGURE_XTICK_ROTATION: Final = 20
+
 # Ablation report schema.
 ABL_COL_SUBSET: Final = "subset"
 ABL_COL_GROUPS: Final = "groups"
@@ -422,6 +438,7 @@ REQUIRED_CONFIG_SECTIONS: Final = (
     "quality",
     "validation",
     "models",
+    "evaluation",
     "ablation",
     "interpretation",
     "prioritization",

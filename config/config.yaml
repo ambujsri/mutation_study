@@ -20,28 +20,39 @@ project:
 paths:
   raw_dir: data/raw
   processed_dir: data/processed
-  models_dir: outputs/models
-  figures_dir: outputs/figures
-  reports_dir: outputs/reports
+  # Deliverable layout: results/ holds everything a reviewer reads, split by kind.
+  models_dir: results/models                  # fitted pipelines + provenance
+  metrics_dir: results/metrics                # CV metrics, OOF predictions, ablation
+  figures_dir: results/figures                # evaluation plots
+  rankings_dir: results/mutation_rankings     # scored candidates and the Top-K table
 
 files:
   labeled: labeled_mutations.csv
   candidates: candidate_mutations_unlabeled.csv
   embeddings: protein_embeddings.csv
-  processed_train: processed_train.parquet          # .parquet | .csv
+  # processed_dir
+  processed_train: processed_train.parquet           # .parquet | .csv
   processed_candidates: processed_candidates.parquet
   feature_manifest: feature_manifest.json           # feature lists + data-quality report
+  # metrics_dir
   cv_fold_summary: cv_fold_summary.csv              # per-fold sizes, group counts, leakage
   oof_predictions: oof_predictions.parquet          # every out-of-fold prediction (long format)
   cv_fold_metrics: cv_fold_metrics.csv              # metrics per strategy x model x target x fold
   cv_metrics_summary: cv_metrics_summary.csv        # pooled OOF + fold mean/std metrics
   model_selection: model_selection.json             # chosen model per target and why
-  training_metadata: training_metadata.json         # provenance for saved models (models_dir)
+  evaluation_markdown: evaluation_summary.md        # headline metrics + optimism gap
+  ablation_study: ablation_study.csv                # feature-subset ablation metrics
+  ablation_markdown: ablation_study.md              # same, for the technical report
+  # models_dir
+  training_metadata: training_metadata.json         # provenance for saved models
+  # figures_dir
+  fig_pred_vs_actual: pred_vs_actual.png            # out-of-fold predictions vs ground truth
+  fig_residuals: residual_distribution.png          # residual histogram per target
+  fig_strategy_comparison: strategy_comparison.png  # selection metric by CV strategy
+  # rankings_dir
   top_candidates: top_10_candidates.csv             # Top-K prioritization table
   top_candidates_markdown: top_10_candidates.md     # same table for the technical report
   all_predictions: candidate_predictions.csv        # all candidates, scored and flagged
-  ablation_study: ablation_study.csv                # feature-subset ablation metrics
-  ablation_markdown: ablation_study.md              # same, for the technical report
   interpretation_markdown: candidate_interpretation.md  # per-candidate scientific breakdown
 
 # -----------------------------------------------------------------------------
@@ -105,6 +116,16 @@ models:
   refit_on_full_data: true               # refit selected models on all labeled data for Phase 4
   save_fold_pipelines: true              # save the selected model's primary-strategy fold pipelines
                                          # (fold ensemble for prediction uncertainty in Phase 4)
+
+# -----------------------------------------------------------------------------
+# Evaluation and visual quality control (src/evaluate.py)
+# Reads the artifacts src/train.py wrote; nothing is refit here.
+# -----------------------------------------------------------------------------
+evaluation:
+  # Strategy the headline table and figures report; null = validation.primary_strategy.
+  strategy: null
+  figures: true                          # write the figures listed under `files` to figures_dir
+  figure_dpi: 150                        # 50-600; 150 keeps the report readable without bloat
 
 # -----------------------------------------------------------------------------
 # Ablation study (Phase 5)

@@ -405,7 +405,7 @@ def test_run_validation_harness_end_to_end(grouped_df: pd.DataFrame, cv_cfg: dic
 
     splits, summary = val.run_validation_harness(cv_cfg)
 
-    report = Path(cv_cfg["paths"]["reports_dir"]) / cv_cfg["files"]["cv_fold_summary"]
+    report = Path(cv_cfg["paths"]["metrics_dir"]) / cv_cfg["files"]["cv_fold_summary"]
     assert report.is_file()
     pd.testing.assert_frame_equal(read_table(report), summary, check_dtype=False)
     assert set(splits) == set(ALL_STRATEGIES)

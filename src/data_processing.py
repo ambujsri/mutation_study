@@ -20,7 +20,7 @@ Steps (each is a standalone function so it can be unit-tested or reused):
 
 Run directly::
 
-    python -m src.preprocess --config config/config.yaml
+    python -m src.data_processing --config config/config.yaml
 """
 
 from __future__ import annotations

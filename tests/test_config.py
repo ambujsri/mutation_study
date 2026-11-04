@@ -352,10 +352,10 @@ def test_resolve_path_anchors_relative_paths_at_project_root(good: dict[str, Any
 
 def test_resolve_path_keeps_absolute_paths(good: dict[str, Any], tmp_path: Path) -> None:
     """Absolute configured paths (e.g. a shared drive) are used unchanged."""
-    good["paths"]["reports_dir"] = str(tmp_path)
+    good["paths"]["metrics_dir"] = str(tmp_path)
 
-    assert resolve_path(good, "reports_dir") == tmp_path
-    assert resolve_path(good, "reports_dir", "cv_fold_summary") == tmp_path / good["files"]["cv_fold_summary"]
+    assert resolve_path(good, "metrics_dir") == tmp_path
+    assert resolve_path(good, "metrics_dir", "cv_fold_summary") == tmp_path / good["files"]["cv_fold_summary"]
 
 
 @pytest.mark.usefixtures("restore_root_logger")

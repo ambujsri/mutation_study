@@ -299,7 +299,7 @@ def run_validation_harness(
     df = read_table(resolve_path(cfg, "processed_dir", "processed_train"))
     logger.info("Loaded processed training table shape=%s", df.shape)
     splits, summary = build_cv_splits(df, cfg)
-    out_path = resolve_path(cfg, "reports_dir", "cv_fold_summary")
+    out_path = resolve_path(cfg, "metrics_dir", "cv_fold_summary")
     write_table(summary, out_path)
     logger.info("Wrote CV fold summary -> %s", out_path)
     return splits, summary

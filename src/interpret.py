@@ -90,8 +90,8 @@ def load_reports(cfg: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]:
     Raises:
         FileNotFoundError: If Phase 4 has not been run.
     """
-    top_path = resolve_path(cfg, "reports_dir", "top_candidates")
-    all_path = resolve_path(cfg, "reports_dir", "all_predictions")
+    top_path = resolve_path(cfg, "rankings_dir", "top_candidates")
+    all_path = resolve_path(cfg, "rankings_dir", "all_predictions")
     for path in (top_path, all_path):
         if not path.is_file():
             raise FileNotFoundError(f"{path} not found; run `python -m src.predict` first")
@@ -325,7 +325,7 @@ def export_report(markdown: str, cfg: dict[str, Any]) -> Path:
     Returns:
         The path written.
     """
-    path = resolve_path(cfg, "reports_dir", "interpretation_markdown")
+    path = resolve_path(cfg, "rankings_dir", "interpretation_markdown")
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(markdown, encoding=const.CONFIG_ENCODING)
     logger.info("Wrote interpretation -> %s", path)

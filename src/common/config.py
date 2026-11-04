@@ -44,6 +44,7 @@ _BOOLEAN_KEYS = (
     "quality.fail_on_row_loss_in_merge",
     "quality.fail_on_duplicate_ids",
     "validation.shuffle",
+    "evaluation.figures",
     "prioritization.ood_flag_unseen_family",
     "models.refit_on_full_data",
     "models.save_fold_pipelines",

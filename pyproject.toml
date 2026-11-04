@@ -17,6 +17,11 @@ ignore = [
     "D107",   # __init__ docstrings (documented on the class)
 ]
 
+[tool.ruff.lint.per-file-ignores]
+# The notebook must put the project root on sys.path before it can import src,
+# so its first-party imports cannot come first in the cell.
+"notebooks/*.ipynb" = ["E402"]
+
 [tool.ruff.lint.pydocstyle]
 convention = "google"
 
