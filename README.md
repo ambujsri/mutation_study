@@ -292,6 +292,66 @@ the stability objective mostly selects the *least destabilizing* mutations; and 
 function spans only 0.798–0.905 across the Top 10, narrower than the target's own RMSE.
 Single-rank ordering within the Top 10 should not be over-read.
 
+### Scientific interpretation: five candidates in detail
+
+Pool context for the feature values below: median conservation 0.439, median solvent
+accessibility 0.551, median distance to active site 15.8 Å, median Δvolume +7.7 Å³.
+Full per-candidate write-ups: `results/mutation_rankings/candidate_interpretation.md`.
+
+**1 · CAND0162 — Y12F (PF03, coil) · rank 2 · the one prediction worth acting on**
+ddG **−0.149 ± 0.038**, function 0.800 ± 0.013. This is the **only shortlisted candidate whose
+stabilizing prediction is resolved** — the effect is ~4× its own ensemble spread. Y→F deletes a
+single hydroxyl while keeping the aromatic ring, so it is near-isosteric (Δvolume **−3.7 Å³**,
+against a pool median of +7.7). At SASA **0.940** — nearly fully solvent-exposed — removing a
+polar hydroxyl raises local hydrophobicity without disturbing any packed core. Conservation is
+low (0.186 vs 0.439 median), so the position is not under strong evolutionary constraint.
+*Concern:* function (0.800) is the second-lowest in the shortlist; under equal weighting that
+costs it rank 1. Weight the campaign toward stability and this becomes the lead candidate.
+
+**2 · CAND0148 — S490L (PF06, helix) · rank 1 · ranked first, but the sign is not resolved**
+ddG **−0.013 ± 0.085**, function 0.861 ± 0.027. The predicted effect is roughly **six times
+smaller than its own uncertainty**, so the honest statement is "approximately neutral", *not*
+"stabilizing". The model likely keys on low conservation (0.333) and high exposure (0.698), the
+pattern it has learned to reward. *Concern:* the physicochemistry argues the other way — this is
+a polar→hydrophobic swap (Δhydrophobicity **+4.6**) with a **+77.7 Å³** volume increase on an
+*exposed* helix face, where burying a large hydrophobic residue is entropically unfavourable.
+Mild destabilization is the more expected outcome. **This is the entry most in need of
+measurement rather than trust**, and the clearest case of the model generalising a heuristic past
+where it applies.
+
+**3 · CAND0126 — Q360F (PF06, coil) · rank 5 · the least certain prediction in the list**
+ddG **−0.019 ± 0.156**, function 0.798 ± 0.012. The stability uncertainty is the **largest of any
+shortlisted candidate and roughly 8× the predicted effect** — the five fold models disagree
+substantially. Δhydrophobicity +6.3 and Δvolume +46.1 Å³ at SASA 0.891 repeat the CAND0148
+pattern. *Concern:* it shares protein **PROT022** with rank 1, so ranks 1 and 5 are not
+independent evidence — a systematic error in that protein's features would move both. Treat them
+as one bet, not two.
+
+**4 · CAND0002 — M496W (PF02, β-strand) · rank 6 · highest raw score, fails the gate**
+ddG **+0.235 ± 0.040** (destabilizing), function **0.878 ± 0.013**. This has the **highest
+priority score in the entire pool (0.885)** yet ranks 6th, because the viability gate sorts ahead
+of the score. It is a pure functional-retention pick: low conservation (0.232), 27.5 Å from the
+active site. The bulky indole of Met→Trp (**+64.9 Å³**) in a β-strand is the obvious source of
+the destabilization, and the tight ensemble (±0.040) means the folds agree it is destabilizing.
+*Interpretation:* the model is confidently right that this will fold worse. Useful only if the
+campaign tolerates a stability cost for functional retention.
+
+**5 · CAND0091 — Y69W (PF08, coil) · rank 14 · the most instructive failure**
+ddG +0.256 ± 0.074, function **0.870 ± 0.004**. The best-ranked candidate from an **unseen family**
+(PF08 has zero labeled examples). Note the function uncertainty: **±0.004, the tightest of every
+candidate discussed here** — on the one mutation where the model has least right to be confident.
+*This is the single most important scientific concern in the whole system.* Fold disagreement
+measures whether the five models agree, not whether they are jointly wrong; on a novel family they
+agree precisely because they share the same blind spot. The quantitative version is in the main
+results: mean spread is *lower* for unseen-family candidates (0.0969) than in-distribution ones
+(0.1031). **Only the explicit `ood_flag` protects against this — never the uncertainty number.**
+
+**What this demonstrates.** The model is not a black box here: each ranking decomposes into
+named features whose values can be checked against biophysical expectation, and in two of five
+cases (CAND0148, CAND0091) that check surfaces a concern the score alone would have hidden. The
+defensible output is "these five clear an absolute bar, and here is what to distrust about each",
+not a ranked list to be taken on faith.
+
 Full analysis: [report/final_report.pdf](report/final_report.pdf) (6 pages), with the
 extended version in [report/final_report_full.md](report/final_report_full.md).
 
@@ -344,6 +404,102 @@ the Top-K size is a config edit, not a code edit.
 
 Contributors: read [docs/CODING_GUIDELINES.md](docs/CODING_GUIDELINES.md) first. Section 4
 defines what goes in `config.yaml` versus `src/common/constants.py`.
+
+## Research extension
+
+Given full sequences, AlphaFold structures, MSAs, MD trajectories, larger experimental datasets
+and GPUs, the following is the order I would actually work in. The ordering is not a wish list —
+each step is justified by a measurement from **this** project, and the first one addresses the
+bottleneck everything else is currently blocked behind.
+
+**1 · Replace the per-protein embedding with residue-level representations.** This is the single
+highest-value change, and the evidence is unusually clean: the 256-d embedding contributes
++0.010/+0.025 Spearman in ablation, scores *negative* rank correlation alone, and moves the
+fitted model by −0.002/+0.000 under permutation. Two independent methods agree it carries almost
+nothing. The cause is structural, not a tuning failure — **the vector is constant within a
+protein**, so it cannot distinguish two mutations in the same protein, which is exactly the task.
+Per-*residue* embeddings from an ESM-style model fix this by construction. The cheapest version
+needs no fine-tuning at all: the wild-type-versus-mutant **log-odds at the mutated position** and
+the **pseudo-log-likelihood difference** are strong zero-shot mutation-effect predictors
+precisely because they vary per mutation. I would add those as features and re-run the ablation
+before training anything larger — if they do not move the grouped-CV number, nothing downstream
+will.
+
+**2 · Fine-tune the foundation model, but only with grouped splits and a frozen trunk first.**
+With 840 labels and 7 families, full fine-tuning of a 650M-parameter model will memorise protein
+identity — the same failure the embedding already exhibits, with more capacity to do it. The
+sequence is: frozen trunk + light head → LoRA/adapter tuning → full fine-tuning only if family-
+grouped performance keeps improving. **Family-grouped CV is the stopping criterion**, not a
+random-split validation loss, because this project measured that gap at up to +0.137 Spearman.
+
+**3 · Structure-aware modelling: GNN, then 3D-equivariant.** The structural block dominates both
+the ablation (−0.143/−0.377 when removed) and the attribution (largest permutation group for
+function, with `distance_to_active_site` alone at +0.314). That is the strongest signal in the
+data, and it is currently represented by four hand-computed scalars. With AlphaFold structures I
+would build a **graph neural network over the residue contact graph**, mutated residue as query
+node, k-nearest-neighbour edges with distance and relative-orientation features — this captures
+packing and local environment that `solvent_accessibility` and `distance_to_active_site` only
+approximate. **SE(3)-equivariant** layers (EGNN, or a tensor-field network) are the principled
+next step, since ΔΔG is invariant to rotation and translation of the structure and an equivariant
+model gets that for free instead of learning it from data it does not have. The existing
+dual-branch architecture is already the right shape: **replace the embedding branch with a
+structural encoder** and keep the fusion trunk.
+
+**4 · Multimodal sequence–structure fusion, with the dual-branch lesson applied.** The natural
+architecture is three branches — residue-level sequence embedding, structural graph, tabular
+physicochemistry — fused with cross-attention. The lesson from this project's dual-branch
+experiment is specific and worth carrying forward: **separating the branches was necessary but
+not sufficient**. A controlled 2×2 showed the architecture change only helped once the loss
+weighting was corrected too, because an unbounded target silently dominated the shared gradients.
+Any multimodal model needs per-task loss scaling (uncertainty weighting, or GradNorm) from the
+start, and each branch ablated independently — otherwise a modality that contributes nothing is
+indistinguishable from one that is being drowned out.
+
+**5 · Evolutionary information from MSAs.** Conservation is currently a single scalar and is
+among the top features. An MSA gives far more: per-position **PSSM columns**, and
+**coupling-derived** terms from a Potts/DCA model that capture epistasis a single-position score
+cannot. Mutating a residue that co-varies with a distant contact is a different proposition from
+mutating an independently varying one. Caution: MSA depth varies per protein, so depth must be
+carried as a feature and a shallow alignment must not be read as "unconstrained".
+
+**6 · MD-derived dynamic features.** Static structure gives one conformation; ΔΔG and functional
+tolerance depend on the ensemble. From trajectories I would extract per-residue **RMSF**,
+solvent-accessibility *variance* rather than a single value, hydrogen-bond occupancy, and
+**local-unfolding frequency** at the mutated position. The scientific bet is specific: the
+stability target is currently the weaker of the two (R² 0.34 vs 0.63), and rigidity/flexibility
+is exactly the information a static snapshot omits. MD is expensive per protein, so I would first
+validate the hypothesis on a subset before computing trajectories at scale.
+
+**7 · Transfer and contrastive learning.** ProTherm/FireProt and ProteinGym are far larger than
+840 rows; pre-train on them and fine-tune on the target assay, with the caveat that experimental
+ΔΔG conventions and buffer conditions differ between sources and must be modelled as a batch
+effect rather than pooled naively. **Contrastive pre-training** is attractive here for a reason
+specific to this problem: training the encoder to place *mutations of the same protein* far apart
+when their effects differ directly attacks the per-protein-constant failure mode, rather than
+patching around it.
+
+**8 · Calibrated uncertainty, then active learning — in that order.** This project produced a
+clear negative result: ensemble spread is *lower* for out-of-distribution candidates (0.0969 vs
+0.1031), so fold disagreement is **blind to domain shift**. Deep ensembles from different
+initialisations, evidential regression, or **conformal prediction** (which gives coverage
+guarantees rather than a bare spread) would replace it, plus a continuous distance-to-training
+-data score in place of the binary `ood_flag`. Only then is active learning safe: an acquisition
+function built on an uncertainty measure blind to novelty would systematically **under-explore
+exactly the novel families** the campaign most needs to learn about. Getting this order wrong
+produces a loop that confidently refines what it already knows.
+
+**9 · Generative design, last and deliberately.** Inverse folding (ProteinMPNN) or a diffusion
+model can propose sequences rather than score a fixed list, which removes the candidate-pool
+ceiling entirely. I would not start here: a generator is only as good as the oracle scoring it,
+and the current oracle cannot resolve stability differences below ~0.4 kcal/mol and is
+overconfident off-distribution. Generation under that oracle would produce fluent, confident,
+unverifiable proposals. Steps 1–8 build the oracle; step 9 is what it is for.
+
+**What I would keep unchanged.** The grouped cross-validation, the leakage assertions, the
+ablation harness and the config-driven reproducibility are not scaffolding to be discarded once
+better models arrive — they are what makes a better model's improvement *believable*. Every
+architecture above should be reported under family-grouped CV with the optimism gap stated, and
+every new feature block should pass through the same ablation before it is trusted.
 
 ## HTTP API
 
