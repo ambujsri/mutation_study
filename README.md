@@ -18,7 +18,7 @@ from two families (`PF08`, `PF09`) that appear nowhere in training. A model vali
 a random split is scored largely on proteins it has already seen, and would therefore
 over-promise on exactly the candidates that matter most.
 
-## Dataset
+## Dataset description
 
 | | Rows | Proteins | Families |
 |---|---|---|---|
@@ -35,7 +35,7 @@ protein** — a fact with consequences, quantified in the ablation below.
 The raw data contains no missing, infinite or out-of-range values; this is verified on
 every run rather than assumed (`src/data_processing.py`, `inspect_anomalies`).
 
-## Setup
+## Setup instructions
 
 Requires **Python 3.11 or newer**. Python 3.10 will not work: the newest scipy that
 supports it (1.15.x) ships macOS arm64 wheels whose compiled extensions fail to load
@@ -55,7 +55,7 @@ python -c "import sys, sklearn, numpy; print(sys.version.split()[0], sklearn.__v
 # expected: 3.11.15 1.9.1 2.4.6
 ```
 
-## How to run
+## How to run the code
 
 Everything, end to end — this covers every assignment task except the EDA notebook:
 
@@ -117,39 +117,6 @@ python -m ruff check .
 python -m mypy src main.py
 ```
 
-## HTTP API
-
-The trained model is also callable over HTTP, for Postman, curl or any client.
-This needs three dependencies the batch pipeline does not, so `src/api.py` is
-the one module that will not import until they are installed — and
-`tests/test_api.py` skips rather than fails in that state:
-
-```bash
-pip install fastapi==0.162.0 uvicorn==0.54.0 pydantic==2.14.2 httpx==0.28.1
-# (all four are already pinned in requirements.txt / requirements-dev.txt)
-
-python -m src.api --config config/config.yaml
-```
-
-| method | path | purpose |
-|:-------|:-----|:--------|
-| GET  | `/health`         | liveness + whether the model loaded |
-| GET  | `/model`          | selected models, CV strategy, seed, versions |
-| POST | `/predict`        | score mutations: predictions, uncertainty, OOD, viability |
-| POST | `/prioritize`     | score and rank, returning the Top-K with justifications |
-| GET  | `/metrics/{name}` | a published metrics table as JSON |
-| GET  | `/figures/{key}`  | a generated PNG |
-| GET  | `/docs`           | interactive schema |
-
-`http://127.0.0.1:8000/openapi.json` imports into Postman as a complete
-collection. A ready-made request body is in
-[docs/api/example_request.json](docs/api/example_request.json).
-
-**Training is not exposed.** A request that blocks for minutes and mutates
-shared artifacts is a batch job with an HTTP trigger, not an API; two
-concurrent callers would corrupt each other's run. Training stays
-`python main.py`, and the service reads what it produced.
-
 ## Model architecture
 
 Every model is a single scikit-learn `Pipeline`, built in [src/model.py](src/model.py):
@@ -169,6 +136,51 @@ tests assert this directly — fitted statistics must equal the training fold's 
 object bit-identical.
 
 Both targets are modelled independently; the model for each is chosen on its own merits.
+
+### Neural networks
+
+Two PyTorch architectures are trained on the **same folds** and the same
+fold-local preprocessing, so any difference measures the model rather than the
+plumbing around it.
+
+**Multitask network** ([src/torch_model.py](src/torch_model.py)) — one shared
+backbone, two task heads:
+
+```text
+tabular (22) + PCA embedding (16)  ->  concatenated (38)
+  -> [Linear -> BatchNorm -> ReLU -> Dropout] x 3   (256 -> 128 -> 64)
+       |- stability head -> Linear -> scalar        (unbounded, kcal/mol)
+       `- function head  -> Linear -> Sigmoid       (bounded to 0-1)
+```
+
+Sharing a backbone is motivated by both targets depending on the same physical
+question — how much the substitution perturbs its local environment — so
+gradients from the better-determined target regularise the representation used
+by the harder one.
+
+**Dual-branch network** ([src/torch_model_v2.py](src/torch_model_v2.py)) —
+the two feature blocks are kept apart until after each is processed:
+
+```text
+tabular (22)   -> [Linear -> BN -> ReLU -> Dropout] x 2   (128 -> 64) --,
+embedding (256) -> [.. x 1] -> Linear(32) -> ReLU  (learned bottleneck) -+
+                                                                        |
+                        concat (96) -> fusion Linear(128)
+                          -> ResidualBlock x 2  -> two heads (as above)
+```
+
+The learned bottleneck **replaces** the fold-local PCA here
+(`torch_v2.embedding_pca: false`). PCA keeps the directions of greatest
+variance, which in a protein-level vector is largely variance *between*
+families — the component that cannot transfer to a held-out family.
+
+Both networks early-stop on an **inner** split carved out of the training fold
+and grouped the same way the outer split is. Stopping on the outer validation
+fold would select the epoch that scores best on the very rows used to report
+performance, so there are two leakage boundaries here, not one. The epoch loop,
+seeding and both boundaries live once in
+[src/torch_training.py](src/torch_training.py); each architecture supplies only
+its preprocessing and its network.
 
 ## Validation approach
 
@@ -214,6 +226,47 @@ All three baselines on both targets under all three splits (18 rows, five metric
 | Ridge | 0.507 | 0.708 |
 | Random forest | 0.522 | 0.721 |
 | **Gradient boosting** | **0.556** | **0.747** |
+
+**Neural networks lose to gradient boosting on both targets.** Same folds, same
+preprocessing, pooled Spearman under `family_group`:
+
+| Model | Family | `stability_ddG` | `functional_score` |
+|---|---|---|---|
+| **Gradient boosting** | boosted trees | **0.556** | **0.747** |
+| Random forest | bagged trees | 0.522 | 0.721 |
+| Ridge | linear | 0.507 | 0.708 |
+| `multitask_nn` | neural net | 0.551 | 0.218 |
+| `dual_branch_nn` | neural net | 0.390 | 0.282 |
+
+The multitask network is effectively tied with the best baseline on stability
+(0.551 vs 0.556) but collapses on function, where its pooled R² of **−0.677** is
+worse than predicting the training mean: the unbounded stability target
+dominates the shared gradients, since a 0–1 function target produces a far
+smaller MSE. The dual-branch architecture was built to test whether separating
+the embedding from the tabular block would help; it recovers function
+(R² −0.677 → −0.002) at the cost of stability. Neither beats the trees. On 840
+rows and 7 families, that is the expected outcome and is reported as such
+rather than tuned until a network wins.
+
+**Attribution agrees with the ablation, by a different mechanism.** Permutation
+importance on held-out fold rows — Spearman lost when a column is shuffled,
+averaged over the 5 folds:
+
+| Feature group | `stability_ddG` | `functional_score` |
+|---|---|---|
+| structural | +0.173 | **+0.383** |
+| deltas | **+0.178** | +0.248 |
+| physicochemical | +0.114 | −0.001 |
+| sequence | −0.004 | +0.003 |
+| **embeddings (all 256)** | **−0.002** | **+0.000** |
+
+The embedding block — shuffled as one unit, so correlation between its columns
+cannot hide its contribution — is indistinguishable from zero, with a
+between-fold spread several times its mean. The ablation removes features and
+refits; this permutes them in the already-fitted production model. Two
+independent routes to the same conclusion. Single strongest features:
+`solvent_accessibility` and `delta_hydrophobicity` for stability,
+`distance_to_active_site` (+0.314, alone twice the next) for function.
 
 **Ablation — the headline scientific finding.** The 256-d embeddings contribute almost
 nothing, and on their own are worse than useless:
@@ -291,6 +344,39 @@ the Top-K size is a config edit, not a code edit.
 
 Contributors: read [docs/CODING_GUIDELINES.md](docs/CODING_GUIDELINES.md) first. Section 4
 defines what goes in `config.yaml` versus `src/common/constants.py`.
+
+## HTTP API
+
+The trained model is also callable over HTTP, for Postman, curl or any client.
+This needs three dependencies the batch pipeline does not, so `src/api.py` is
+the one module that will not import until they are installed — and
+`tests/test_api.py` skips rather than fails in that state:
+
+```bash
+pip install fastapi==0.162.0 uvicorn==0.54.0 pydantic==2.14.2 httpx==0.28.1
+# (all four are already pinned in requirements.txt / requirements-dev.txt)
+
+python -m src.api --config config/config.yaml
+```
+
+| method | path | purpose |
+|:-------|:-----|:--------|
+| GET  | `/health`         | liveness + whether the model loaded |
+| GET  | `/model`          | selected models, CV strategy, seed, versions |
+| POST | `/predict`        | score mutations: predictions, uncertainty, OOD, viability |
+| POST | `/prioritize`     | score and rank, returning the Top-K with justifications |
+| GET  | `/metrics/{name}` | a published metrics table as JSON |
+| GET  | `/figures/{key}`  | a generated PNG |
+| GET  | `/docs`           | interactive schema |
+
+`http://127.0.0.1:8000/openapi.json` imports into Postman as a complete
+collection. A ready-made request body is in
+[docs/api/example_request.json](docs/api/example_request.json).
+
+**Training is not exposed.** A request that blocks for minutes and mutates
+shared artifacts is a batch job with an HTTP trigger, not an API; two
+concurrent callers would corrupt each other's run. Training stays
+`python main.py`, and the service reads what it produced.
 
 ## Reproducibility
 
