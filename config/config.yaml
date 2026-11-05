@@ -57,8 +57,11 @@ files:
   torch_v2_fold_summary: torch_v2_fold_summary.csv  # early-stopping epoch per fold
   torch_v2_comparison: torch_v2_vs_baselines.csv    # dual-branch against every other model
   torch_v2_comparison_markdown: torch_v2_vs_baselines.md  # same, for the technical report
-  ablation_study: ablation_study.csv                # feature-subset ablation metrics
-  ablation_markdown: ablation_study.md              # same, for the technical report
+  feature_importances: feature_importances.csv      # per-feature attribution, averaged over folds
+  feature_group_importances: feature_group_importances.csv  # the same, summed per feature group
+  attribution_markdown: feature_attribution.md      # attribution write-up for the report
+  ablation_summary: ablation_summary.csv            # feature-subset ablation metrics
+  ablation_summary_markdown: ablation_summary.md    # same, for the technical report
   # models_dir
   training_metadata: training_metadata.json         # provenance for saved models
   # figures_dir
@@ -71,6 +74,9 @@ files:
   fig_torch_v2_learning_curves: torch_v2_learning_curves.png  # dual-branch loss per fold x epoch
   fig_model_comparison_v2: model_comparison_v2.png  # every metric, all models incl. dual-branch
   fig_baseline_vs_torch_v2: baseline_vs_dual_branch_fit.png  # fit and residuals vs the baseline
+  fig_ablation_drop: ablation_performance_drop.png  # metric change when a feature group is cut
+  fig_feature_importance: feature_importance.png    # top features by permutation importance
+  fig_group_importance: feature_group_importance.png  # importance summed by feature group
   # rankings_dir
   top_candidates: top_10_candidates.csv             # Top-K prioritization table
   top_candidates_markdown: top_10_candidates.md     # same table for the technical report
@@ -227,6 +233,26 @@ torch_v2:
   save_fold_models: true
 
 # -----------------------------------------------------------------------------
+# Feature attribution (src/attribution.py, assignment Task 7)
+# Explains the SELECTED model: which inputs it actually used, measured on
+# held-out fold rows rather than on the rows it was fitted to.
+# -----------------------------------------------------------------------------
+attribution:
+  # permutation = shuffle a column on the fold's validation rows and measure
+  # the loss of skill (honest, model-agnostic, defined on ORIGINAL columns).
+  # impurity = the tree ensemble's internal split gains (training-set based,
+  # biased toward high-cardinality features, and defined on POST-PCA inputs).
+  kinds: [permutation, impurity]
+  # Metric degraded by the shuffle. Spearman matches how candidates are ranked.
+  scoring_metric: spearman
+  # Shuffles per feature per fold. Higher is less noisy and linearly slower.
+  n_repeats: 5
+  # Permuting all 256 embedding columns one at a time is slow and says little:
+  # they are a protein-level block, so they are shuffled together as one unit.
+  group_embeddings_as_block: true
+  top_k: 20                            # features drawn in the per-feature figure
+
+# -----------------------------------------------------------------------------
 # Evaluation and visual quality control (src/evaluate.py)
 # Reads the artifacts src/train.py wrote; nothing is refit here.
 # -----------------------------------------------------------------------------
@@ -292,6 +318,18 @@ prioritization:
   # combined uncertainty, so it is on the same 0-1 scale as the objectives.
   uncertainty_penalty: 0.25
   ood_flag_unseen_family: true           # flag candidates from families absent in training
+  # Multi-objective viability gate: a candidate is viable only if it is
+  # predicted to stabilize AND to retain function. On the current candidate
+  # pool only 5 of 180 clear the stability gate, so excluding non-viable
+  # candidates outright would return a Top 5, not a Top 10.
+  viability:
+    enabled: true
+    max_stability_ddG: 0.0               # ddG at or below this counts as stabilizing
+    min_functional_score: 0.7            # retention at or above this counts as functional
+    # false: rank viable candidates above the rest but still report top_k rows,
+    #        so the shortlist stays the requested length and the gate is visible.
+    # true:  drop non-viable candidates entirely, which may return fewer rows.
+    exclude_non_viable: false
 
 # -----------------------------------------------------------------------------
 # Logging

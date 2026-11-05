@@ -907,6 +907,231 @@ def plot_baseline_vs_torch(
     return _save(fig, path, dpi)
 
 
+def plot_ablation_performance_drop(
+    table: pd.DataFrame, cfg: dict[str, Any], path: Path, dpi: int
+) -> Path:
+    """Chart each feature subset's metric change against the baseline subset.
+
+    One row per headline metric, one column per target. Bars are the signed
+    difference from the baseline subset, so the zero line *is* the full feature
+    set and a bar's length is exactly what removing (or keeping only) that
+    group costs. Colour encodes the direction after accounting for each
+    metric's polarity, which matters because the same sign means opposite
+    things for an error metric and a correlation.
+
+    Horizontal bars, because subset names are long and reading seven rotated
+    labels is worse than reading seven horizontal ones.
+    """
+    plt = _pyplot()
+
+    baseline_name = cfg["ablation"]["baseline"]
+    metrics = [m for m in const.ABL_HEADLINE_METRICS if m in set(configured_metrics(cfg))]
+    targets = [t for t in const.TARGETS.values() if t in set(table[const.COL_TARGET])]
+    # Config order, baseline last, so the arms read in the order they are declared.
+    subsets = [s for s in dict.fromkeys(table[const.ABL_COL_SUBSET]) if s != baseline_name]
+
+    fig, axes = plt.subplots(
+        len(metrics),
+        len(targets),
+        figsize=(6.0 * len(targets), 0.55 * len(subsets) * len(metrics) + 2.2),
+        squeeze=False,
+    )
+    positions = np.arange(len(subsets), dtype=float)
+    for row, metric in enumerate(metrics):
+        column_name = f"{const.ABL_DELTA_PREFIX}{metric.value}"
+        higher_is_better = const.METRIC_GREATER_IS_BETTER[metric]
+        for column, target in enumerate(targets):
+            ax = axes[row][column]
+            rows = table[table[const.COL_TARGET] == target].set_index(const.ABL_COL_SUBSET)
+            values = [
+                float(rows.loc[subset, column_name]) if subset in rows.index else float("nan")
+                for subset in subsets
+            ]
+            # A drop is a loss whatever the metric's polarity: for r2/spearman
+            # that is a negative delta, for rmse/mae a positive one.
+            colors = [
+                const.ABL_COLOR_LOSS
+                if (value < 0) == higher_is_better
+                else const.ABL_COLOR_GAIN
+                for value in values
+            ]
+            ax.barh(positions, values, color=colors)
+            ax.set_yticks(positions)
+            ax.set_yticklabels(subsets, fontsize=8)
+            ax.invert_yaxis()
+            ax.axvline(0.0, linewidth=1.0, color="black")
+            ax.set_xlabel(f"Δ {metric.value} vs {baseline_name}")
+            ax.set_title(f"{target}", fontsize=10)
+            span = max((abs(v) for v in values if np.isfinite(v)), default=1.0) or 1.0
+            ax.set_xlim(-span * 1.35, span * 1.35)
+            for y, value in zip(positions, values, strict=True):
+                if not np.isfinite(value):
+                    continue
+                offset = const.ABL_BAR_LABEL_PAD * span / abs(span)
+                ax.text(
+                    value + (offset if value >= 0 else -offset),
+                    y,
+                    f"{value:+.3f}",
+                    va="center",
+                    ha="left" if value >= 0 else "right",
+                    fontsize=8,
+                )
+    fig.suptitle(
+        f"Feature-group attribution: change from the full set (`{baseline_name}`) "
+        f"under {table[const.CV_COL_STRATEGY].iloc[0]} cross-validation"
+    )
+    return _save(fig, path, dpi)
+
+
+def plot_feature_importance(
+    per_feature: pd.DataFrame, cfg: dict[str, Any], path: Path, dpi: int
+) -> Path:
+    """Chart the top features per target, coloured by feature group.
+
+    Only the permutation kind is drawn when it is available: impurity
+    importances live on post-PCA inputs and on a different scale, so putting
+    the two on one axis would invite a comparison that is not meaningful.
+
+    Error bars are the between-fold standard deviation. A bar whose whisker
+    crosses zero is not a stable attribution on this dataset, and showing that
+    is the point of drawing them.
+    """
+    plt = _pyplot()
+
+    top_k = int(cfg["attribution"]["top_k"])
+    kinds = list(dict.fromkeys(per_feature[const.ATTR_COL_KIND]))
+    kind = const.ImportanceKind.PERMUTATION.value
+    kind = kind if kind in kinds else kinds[0]
+    rows_for_kind = per_feature[per_feature[const.ATTR_COL_KIND] == kind]
+    targets = [t for t in const.TARGETS.values() if t in set(rows_for_kind[const.COL_TARGET])]
+
+    fig, axes = plt.subplots(
+        1, len(targets), figsize=(7.0 * len(targets), 0.32 * top_k + 2.0), squeeze=False
+    )
+    for column, target in enumerate(targets):
+        ax = axes[0][column]
+        rows = rows_for_kind[rows_for_kind[const.COL_TARGET] == target].head(top_k)
+        positions = np.arange(len(rows), dtype=float)
+        colors = [
+            const.ATTR_GROUP_COLORS.get(group, const.ABL_COLOR_LOSS)
+            for group in rows[const.ATTR_COL_GROUP]
+        ]
+        ax.barh(
+            positions,
+            rows[const.ATTR_COL_MEAN].to_numpy(dtype=float),
+            xerr=rows[const.ATTR_COL_STD].to_numpy(dtype=float),
+            color=colors,
+            error_kw={"elinewidth": 0.8, "ecolor": "#444444"},
+        )
+        ax.set_yticks(positions)
+        ax.set_yticklabels(rows[const.ATTR_COL_FEATURE], fontsize=8)
+        ax.invert_yaxis()
+        ax.axvline(0.0, linewidth=1.0, color="black")
+        ax.set_xlabel(f"{cfg['attribution']['scoring_metric']} lost when shuffled")
+        ax.set_title(target, fontsize=10)
+    handles = [
+        plt.Rectangle((0, 0), 1, 1, color=color)
+        for group, color in const.ATTR_GROUP_COLORS.items()
+        if group in set(rows_for_kind[const.ATTR_COL_GROUP])
+    ]
+    labels = [
+        group
+        for group in const.ATTR_GROUP_COLORS
+        if group in set(rows_for_kind[const.ATTR_COL_GROUP])
+    ]
+    if handles:
+        axes[0][0].legend(handles, labels, title="feature group", fontsize=8, loc="lower right")
+    fig.suptitle(
+        f"Top {top_k} features by {kind} importance, averaged over "
+        f"{cfg['validation']['primary_strategy']} folds"
+    )
+    return _save(fig, path, dpi)
+
+
+def plot_group_importance(
+    per_group: pd.DataFrame, cfg: dict[str, Any], path: Path, dpi: int
+) -> Path:
+    """Chart importance summed within each feature group, per target.
+
+    This is the figure that answers the ablation question directly: how much
+    of the model's realised skill comes from each *source* of information,
+    rather than from any one column.
+    """
+    plt = _pyplot()
+
+    kind = const.ImportanceKind.PERMUTATION.value
+    kinds = list(dict.fromkeys(per_group[const.ATTR_COL_KIND]))
+    kind = kind if kind in kinds else kinds[0]
+    rows_for_kind = per_group[per_group[const.ATTR_COL_KIND] == kind]
+    targets = [t for t in const.TARGETS.values() if t in set(rows_for_kind[const.COL_TARGET])]
+    groups = [g for g in const.ATTR_GROUP_COLORS if g in set(rows_for_kind[const.ATTR_COL_GROUP])]
+
+    fig, axes = plt.subplots(1, len(targets), figsize=(5.5 * len(targets), 4.2), squeeze=False)
+    for column, target in enumerate(targets):
+        ax = axes[0][column]
+        rows = rows_for_kind[rows_for_kind[const.COL_TARGET] == target].set_index(
+            const.ATTR_COL_GROUP
+        )
+        heights = [
+            float(rows.loc[group, const.ATTR_COL_MEAN]) if group in rows.index else 0.0
+            for group in groups
+        ]
+        positions = np.arange(len(groups), dtype=float)
+        ax.bar(positions, heights, color=[const.ATTR_GROUP_COLORS[g] for g in groups])
+        ax.set_xticks(positions)
+        ax.set_xticklabels(groups, rotation=const.FIGURE_XTICK_ROTATION, ha="right", fontsize=8)
+        ax.axhline(0.0, linewidth=1.0, color="black")
+        ax.set_ylabel(f"summed {cfg['attribution']['scoring_metric']} lost when shuffled")
+        ax.set_title(target, fontsize=10)
+        for x, height in zip(positions, heights, strict=True):
+            ax.text(x, height, f"{height:+.3f}", ha="center",
+                    va="bottom" if height >= 0 else "top", fontsize=8)
+    fig.suptitle(f"Where the model's skill comes from, by feature group ({kind} importance)")
+    return _save(fig, path, dpi)
+
+
+def make_attribution_figures(
+    per_feature: pd.DataFrame, per_group: pd.DataFrame, cfg: dict[str, Any]
+) -> dict[str, Path]:
+    """Write the Task 7 figures; returns the written paths (empty if disabled)."""
+    if not cfg["evaluation"]["figures"]:
+        logger.info("evaluation.figures is false: skipping the attribution figures")
+        return {}
+    dpi = cfg["evaluation"]["figure_dpi"]
+    paths = _figure_paths(cfg, const.ATTR_FIGURE_FILE_KEYS)
+    written: dict[str, Path] = {}
+    if not per_feature.empty:
+        written["fig_feature_importance"] = plot_feature_importance(
+            per_feature, cfg, paths["fig_feature_importance"], dpi
+        )
+    if not per_group.empty:
+        written["fig_group_importance"] = plot_group_importance(
+            per_group, cfg, paths["fig_group_importance"], dpi
+        )
+    for key, figure in written.items():
+        logger.info("Wrote %s -> %s", key, figure)
+    return written
+
+
+def make_ablation_figures(table: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Path]:
+    """Write the ablation figure; returns the written paths (empty if disabled)."""
+    if not cfg["evaluation"]["figures"]:
+        logger.info("evaluation.figures is false: skipping the ablation figure")
+        return {}
+    if table.empty:
+        logger.warning("Ablation table is empty: no figure to draw")
+        return {}
+    paths = _figure_paths(cfg, const.ABLATION_FIGURE_FILE_KEYS)
+    written = {
+        "fig_ablation_drop": plot_ablation_performance_drop(
+            table, cfg, paths["fig_ablation_drop"], cfg["evaluation"]["figure_dpi"]
+        )
+    }
+    for key, figure in written.items():
+        logger.info("Wrote %s -> %s", key, figure)
+    return written
+
+
 def make_torch_figures(
     torch_oof: pd.DataFrame,
     history: pd.DataFrame,

@@ -263,6 +263,62 @@ def normalize_objective(values: pd.Series, method: const.ScoreNormalization) -> 
     return ((values - low) / (high - low)).astype(float)
 
 
+def apply_viability_gate(df: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
+    """Mark which candidates clear both biological objectives.
+
+    The weighted priority score is a *relative* ranking within the candidate
+    pool: normalisation guarantees that something always scores near 1.0, even
+    if every candidate is predicted destabilizing. The gate is the absolute
+    check that the score cannot express — a candidate is viable only when it
+    is predicted to stabilize (``ddG <= max_stability_ddG``) **and** to retain
+    function (``functional_score >= min_functional_score``).
+
+    The two conditions are recorded separately, and the summary
+    ``viability`` column says which one failed, because "destabilizing but
+    fully functional" and "stabilizing but dead" are different experiments to
+    reject for different reasons.
+
+    Returns:
+        ``df`` with ``meets_stability_gate``, ``meets_function_gate``,
+        ``is_viable`` and ``viability`` added. With the gate disabled every
+        candidate is marked viable, so downstream ordering is unaffected.
+    """
+    settings = cfg["prioritization"]["viability"]
+    out = df.copy()
+    if not settings["enabled"]:
+        out[const.COL_MEETS_STABILITY_GATE] = True
+        out[const.COL_MEETS_FUNCTION_GATE] = True
+        out[const.COL_IS_VIABLE] = True
+        out[const.COL_VIABILITY] = const.VIABILITY_PASS
+        logger.info("Viability gate disabled: every candidate is treated as viable")
+        return out
+
+    max_ddg = float(settings["max_stability_ddG"])
+    min_function = float(settings["min_functional_score"])
+    stability = out[f"{const.PRED_PREFIX}{const.TARGET_STABILITY}"] <= max_ddg
+    function = out[f"{const.PRED_PREFIX}{const.TARGET_FUNCTION}"] >= min_function
+    out[const.COL_MEETS_STABILITY_GATE] = stability
+    out[const.COL_MEETS_FUNCTION_GATE] = function
+    out[const.COL_IS_VIABLE] = stability & function
+    out[const.COL_VIABILITY] = np.select(
+        [stability & function, ~stability & function, stability & ~function],
+        [const.VIABILITY_PASS, const.VIABILITY_FAIL_STABILITY, const.VIABILITY_FAIL_FUNCTION],
+        default=const.VIABILITY_FAIL_BOTH,
+    )
+    logger.info(
+        "Viability gate (ddG <= %.2f and function >= %.2f): %d/%d pass "
+        "(%d fail stability only, %d fail function only, %d fail both)",
+        max_ddg,
+        min_function,
+        int(out[const.COL_IS_VIABLE].sum()),
+        len(out),
+        int((~stability & function).sum()),
+        int((stability & ~function).sum()),
+        int((~stability & ~function).sum()),
+    )
+    return out
+
+
 def score_candidates(df: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
     """Combine the stability and function objectives into one priority score.
 
@@ -311,9 +367,24 @@ def score_candidates(df: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
 
     penalty = float(p["uncertainty_penalty"])
     out[const.COL_PRIORITY_SCORE] = objective - penalty * out[const.COL_NORM_UNCERTAINTY]
-    out = out.sort_values(
-        [const.COL_PRIORITY_SCORE, const.COL_MUTATION_ID], ascending=[False, True], kind="stable"
-    ).reset_index(drop=True)
+
+    out = apply_viability_gate(out, cfg)
+    viability = p["viability"]
+    if viability["enabled"] and viability["exclude_non_viable"]:
+        kept = out[out[const.COL_IS_VIABLE]]
+        logger.info("Excluding non-viable candidates: %d of %d kept", len(kept), len(out))
+        out = kept.copy()
+
+    # Viability is a hard constraint and the score is a soft preference, so the
+    # gate sorts first: a viable candidate outranks every non-viable one
+    # regardless of score. Ties break on mutation_id, which makes the order
+    # reproducible rather than dependent on row order.
+    sort_columns = [const.COL_PRIORITY_SCORE, const.COL_MUTATION_ID]
+    ascending = [False, True]
+    if viability["enabled"]:
+        sort_columns.insert(0, const.COL_IS_VIABLE)
+        ascending.insert(0, False)
+    out = out.sort_values(sort_columns, ascending=ascending, kind="stable").reset_index(drop=True)
     out[const.COL_PRIORITY_RANK] = np.arange(1, len(out) + 1)
 
     logger.info(
@@ -342,6 +413,16 @@ def justify(row: pd.Series, cfg: dict[str, Any]) -> str:
         f"function percentile {100 * row[f'{const.NORM_PREFIX}{const.TARGET_FUNCTION}']:.0f}",
         f"fold disagreement {row[const.COL_TOTAL_UNCERTAINTY]:.3f}",
     ]
+    gate = row.get(const.COL_VIABILITY)
+    if gate == const.VIABILITY_PASS:
+        parts.append("clears both viability gates")
+    elif gate == const.VIABILITY_FAIL_STABILITY:
+        parts.append("below the stability gate, so shortlisted on function and ranking alone")
+    elif gate == const.VIABILITY_FAIL_FUNCTION:
+        parts.append("below the functional-retention gate")
+    elif gate == const.VIABILITY_FAIL_BOTH:
+        parts.append("clears neither viability gate")
+
     if row[const.COL_OOD_FLAG] == const.OOD_UNSEEN_FAMILY:
         parts.append(f"family {row[const.COL_PROTEIN_FAMILY]} unseen in training, so treat as exploratory")
     elif row[const.COL_OOD_FLAG] == const.OOD_UNSEEN_PROTEIN:
@@ -380,6 +461,34 @@ def build_top_k(scored: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
 # =============================================================================
 # 5. Export
 # =============================================================================
+def _viability_lines(scored: pd.DataFrame, cfg: dict[str, Any]) -> list[str]:
+    """State how many candidates cleared the gate, and what that means for the shortlist.
+
+    Written out explicitly because a shortlist of ten rows from a pool where
+    only a handful are viable invites the reader to assume all ten are
+    actionable. They are not, and the report has to say so.
+    """
+    settings = cfg["prioritization"]["viability"]
+    if not settings["enabled"] or const.COL_IS_VIABLE not in scored:
+        return []
+    viable = int(scored[const.COL_IS_VIABLE].sum())
+    lines = [
+        f"**Viability gate.** {viable} of {len(scored)} candidates are predicted both stabilizing "
+        f"(ddG <= {settings['max_stability_ddG']}) and functional "
+        f"(retention >= {settings['min_functional_score']}).",
+        "",
+    ]
+    if settings["exclude_non_viable"]:
+        lines[0] += " Non-viable candidates were excluded before ranking."
+    else:
+        lines[0] += (
+            " Viable candidates are ranked above all others; any remaining rows in the table below"
+            " fall short of a gate and are shown for completeness, with the failing gate named in"
+            " the `viability` column. They are not wet-lab ready."
+        )
+    return lines
+
+
 def to_markdown(
     report: pd.DataFrame, scored: pd.DataFrame, cfg: dict[str, Any], artifacts: TrainedArtifacts
 ) -> str:
@@ -407,6 +516,7 @@ def to_markdown(
         "bound on predictive uncertainty: it misses error shared by every fold, which is the main risk "
         "for unseen families.",
         "",
+        *_viability_lines(scored, cfg),
         table.to_markdown(index=False, floatfmt=const.MARKDOWN_FLOAT_FORMAT),
         "",
         "## Justification",

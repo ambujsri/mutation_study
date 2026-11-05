@@ -4,7 +4,8 @@ Runs the stages in dependency order, each of which is also runnable on its own
 as ``python -m src.<stage>``:
 
     data_processing -> validation -> train -> train_torch -> train_torch_v2
-                                  -> evaluate -> predict -> ablation -> interpret
+                                  -> evaluate -> predict -> ablation -> attribution
+                                  -> interpret
 
 Every stage reads its inputs from, and writes its outputs to, the locations in
 ``config/config.yaml``; this module adds no behaviour of its own beyond
@@ -34,6 +35,7 @@ from typing import Any
 
 from src.ablation import export_artifacts as export_ablation
 from src.ablation import run_ablation
+from src.attribution import run_attribution
 from src.common.config import DEFAULT_CONFIG_PATH, load_config, setup_logging
 from src.data_processing import run_preprocessing
 from src.evaluate import run_evaluation
@@ -84,6 +86,7 @@ STAGES: dict[str, Callable[[dict[str, Any]], Any]] = {
     "evaluate": run_evaluation,
     "predict": run_prediction,
     "ablation": _ablation_stage,
+    "attribution": run_attribution,
     "interpret": run_interpretation,
 }
 

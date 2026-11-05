@@ -17,6 +17,7 @@ import pytest
 
 from src import ablation as ab
 from src import data_processing as pp
+from src import evaluate as ev
 from src import model as md
 from src import train as tr
 from src.common import constants as const
@@ -267,8 +268,8 @@ def test_export_writes_csv_and_markdown(ablation_table: pd.DataFrame, ablation_c
     """Both artifacts are written and the CSV round-trips."""
     paths = ab.export_artifacts(ablation_table, ablation_cfg)
 
-    pd.testing.assert_frame_equal(read_table(paths["ablation_study"]), ablation_table, check_dtype=False)
-    assert paths["ablation_markdown"].read_text().startswith("# Feature-subset ablation")
+    pd.testing.assert_frame_equal(read_table(paths["ablation_summary"]), ablation_table, check_dtype=False)
+    assert paths["ablation_summary_markdown"].read_text().startswith("# Feature-subset ablation")
 
 
 def test_ablation_uses_configured_strategy(ablation_cfg: dict[str, Any]) -> None:
@@ -294,3 +295,73 @@ def test_ablation_is_deterministic(ablation_cfg: dict[str, Any]) -> None:
     second = ab.run_ablation(ablation_cfg)
 
     pd.testing.assert_frame_equal(first, second)
+
+
+# =============================================================================
+# Attribution reporting and the figure (assignment Task 6)
+# =============================================================================
+def test_markdown_reports_a_delta_for_both_headline_metrics(
+    ablation_table: pd.DataFrame, ablation_cfg: dict[str, Any]
+) -> None:
+    """Spearman and R2 each get a level and a delta.
+
+    A feature group can matter for the ordering and not for the magnitudes, or
+    the reverse, so reporting only the selection metric would hide half of the
+    attribution.
+    """
+    markdown = ab.to_markdown(ablation_table, ablation_cfg)
+
+    for metric in const.ABL_HEADLINE_METRICS:
+        assert f"{const.POOLED_PREFIX}{metric.value}" in markdown
+        assert f"{const.ABL_DELTA_PREFIX}{metric.value}" in markdown
+    assert f"{const.POOLED_PREFIX}{const.Metric.PEARSON.value}" in markdown
+
+
+def test_markdown_survives_a_reduced_metric_set(
+    ablation_table: pd.DataFrame, ablation_cfg: dict[str, Any]
+) -> None:
+    """Columns the configured metric list does not produce are omitted, not crashed on."""
+    reduced = ablation_table.drop(
+        columns=[c for c in ablation_table.columns if const.Metric.PEARSON.value in c]
+    )
+
+    markdown = ab.to_markdown(reduced, ablation_cfg)
+
+    assert f"{const.POOLED_PREFIX}{const.Metric.PEARSON.value}" not in markdown
+    assert f"{const.POOLED_PREFIX}{const.Metric.SPEARMAN.value}" in markdown
+
+
+def test_ablation_figure_is_written(
+    ablation_table: pd.DataFrame, ablation_cfg: dict[str, Any]
+) -> None:
+    """The attribution figure lands under its configured name."""
+    written = ev.make_ablation_figures(ablation_table, ablation_cfg)
+
+    assert set(written) == set(const.ABLATION_FIGURE_FILE_KEYS)
+    path = written["fig_ablation_drop"]
+    assert path == Path(ablation_cfg["paths"]["figures_dir"], ablation_cfg["files"]["fig_ablation_drop"])
+    assert path.is_file() and path.stat().st_size > 0
+
+
+def test_ablation_figure_honours_the_figures_switch(
+    ablation_table: pd.DataFrame, ablation_cfg: dict[str, Any]
+) -> None:
+    """``evaluation.figures: false`` suppresses it, as for every other figure."""
+    ablation_cfg["evaluation"]["figures"] = False
+
+    assert ev.make_ablation_figures(ablation_table, ablation_cfg) == {}
+
+
+def test_ablation_figure_skipped_on_an_empty_table(ablation_cfg: dict[str, Any]) -> None:
+    """Nothing to attribute means no figure, rather than an empty one."""
+    assert ev.make_ablation_figures(pd.DataFrame(), ablation_cfg) == {}
+
+
+def test_export_also_writes_the_figure(
+    ablation_table: pd.DataFrame, ablation_cfg: dict[str, Any]
+) -> None:
+    """The stage emits all three Task 6 artifacts in one call."""
+    paths = ab.export_artifacts(ablation_table, ablation_cfg)
+
+    assert {"ablation_summary", "ablation_summary_markdown", "fig_ablation_drop"} <= set(paths)
+    assert all(path.exists() for path in paths.values())

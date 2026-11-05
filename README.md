@@ -82,6 +82,7 @@ python -m src.train_torch_v2  --config config/config.yaml   # dual-branch NN, sa
 python -m src.evaluate        --config config/config.yaml   # metrics, comparison, figures
 python -m src.predict         --config config/config.yaml   # score candidates, Top 10
 python -m src.ablation        --config config/config.yaml   # feature-subset ablation
+python -m src.attribution     --config config/config.yaml   # permutation + impurity importance
 python -m src.interpret       --config config/config.yaml   # per-candidate write-up
 ```
 
@@ -92,7 +93,7 @@ Homebrew/PyPI build.
 Checks:
 
 ```bash
-python -m pytest -q        # 704 tests
+python -m pytest -q        # 765 tests
 python -m ruff check .
 python -m mypy src main.py
 ```
@@ -208,8 +209,9 @@ src/torch_model.py              Multitask network: shared backbone, two task hea
 src/train_torch.py              Fold-local network training, early stopping, benchmark
 src/torch_model_v2.py           Dual-branch network: separate branches, residual fusion
 src/train_torch_v2.py           Fold-local dual-branch training, two branch preprocessors
-src/predict.py                  Ensemble inference, uncertainty, OOD flags, Top 10
-src/ablation.py                 Feature-subset ablation study
+src/predict.py                  Ensemble inference, uncertainty, viability gate, OOD flags, Top 10
+src/ablation.py                 Feature-subset ablation study and attribution figure
+src/attribution.py              Permutation and impurity feature importance (Task 7)
 src/interpret.py                Per-candidate scientific interpretation
 results/metrics/                CV metrics, OOF predictions, baseline benchmark, model
                                 comparison (CSV + JSON), ablation
@@ -220,7 +222,7 @@ results/models/                 Fitted pipelines, network weights, provenance me
 report/final_report.md          Source for the 6-page technical report
 report/final_report.pdf         The report deliverable (built by report/build_pdf.py)
 report/final_report_full.md     Extended version: full derivations, all candidate write-ups
-tests/                          704 tests, mirroring src/
+tests/                          765 tests, mirroring src/
 main.py                         End-to-end orchestration
 docs/CODING_GUIDELINES.md       Standards every change must follow
 ```

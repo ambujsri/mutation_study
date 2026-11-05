@@ -513,3 +513,166 @@ def test_run_prediction_requires_processed_candidates(phase4_cfg: dict[str, Any]
 
     with pytest.raises(FileNotFoundError, match="previous pipeline stage"):
         pr.run_prediction(phase4_cfg)
+
+
+# =============================================================================
+# Multi-objective viability gate (assignment Task 8)
+# =============================================================================
+def gate_cfg(cfg: dict[str, Any], **overrides: Any) -> dict[str, Any]:
+    """Apply viability settings on top of a config, leaving the rest alone."""
+    cfg["prioritization"]["viability"].update(overrides)
+    return cfg
+
+
+def test_gate_passes_only_candidates_clearing_both_objectives(phase4_cfg: dict[str, Any]) -> None:
+    """Viability is a conjunction: stabilizing AND functional, never either alone."""
+    gate_cfg(phase4_cfg, enabled=True, max_stability_ddG=0.0, min_functional_score=0.7)
+    #                     stabilizing? functional?
+    df = make_scored(ddg=[-0.5, -0.5, 0.5, 0.5], func=[0.9, 0.1, 0.9, 0.1])
+
+    gated = pr.apply_viability_gate(df, phase4_cfg)
+
+    assert gated[const.COL_IS_VIABLE].tolist() == [True, False, False, False]
+    assert gated[const.COL_VIABILITY].tolist() == [
+        const.VIABILITY_PASS,
+        const.VIABILITY_FAIL_FUNCTION,
+        const.VIABILITY_FAIL_STABILITY,
+        const.VIABILITY_FAIL_BOTH,
+    ]
+
+
+def test_gate_boundaries_are_inclusive(phase4_cfg: dict[str, Any]) -> None:
+    """A candidate exactly on a threshold passes; the comparison is <= and >=.
+
+    Pinned because flipping either to a strict inequality would silently drop
+    boundary candidates from the shortlist.
+    """
+    gate_cfg(phase4_cfg, enabled=True, max_stability_ddG=0.0, min_functional_score=0.7)
+    df = make_scored(ddg=[0.0, 0.001], func=[0.7, 0.7])
+
+    gated = pr.apply_viability_gate(df, phase4_cfg)
+
+    assert gated[const.COL_IS_VIABLE].tolist() == [True, False]
+
+
+def test_disabled_gate_marks_everything_viable(phase4_cfg: dict[str, Any]) -> None:
+    """Turning the gate off must not reorder anything or drop a candidate."""
+    gate_cfg(phase4_cfg, enabled=False)
+    df = make_scored(ddg=[5.0, -5.0], func=[0.0, 1.0])
+
+    gated = pr.apply_viability_gate(df, phase4_cfg)
+
+    assert gated[const.COL_IS_VIABLE].all()
+    assert set(gated[const.COL_VIABILITY]) == {const.VIABILITY_PASS}
+
+
+def test_viable_candidates_outrank_higher_scoring_non_viable_ones(
+    phase4_cfg: dict[str, Any],
+) -> None:
+    """The gate is a hard constraint, so it sorts before the soft priority score.
+
+    CAND0002 scores higher on the weighted objective but fails the stability
+    gate; CAND0001 clears both gates and must still rank first.
+
+    Function is weighted up so the soft score genuinely prefers CAND0002:
+    with equal weights the two tie, and a tie would not test anything.
+    """
+    gate_cfg(phase4_cfg, enabled=True, max_stability_ddG=0.0, min_functional_score=0.7)
+    phase4_cfg["prioritization"]["uncertainty_penalty"] = 0.0
+    phase4_cfg["prioritization"]["weights"] = {"stability": 0.2, "function": 0.8}
+    phase4_cfg["prioritization"]["score_normalization"] = const.ScoreNormalization.MINMAX.value
+    df = make_scored(ddg=[-0.1, 0.5], func=[0.75, 1.0])
+
+    scored = pr.score_candidates(df, phase4_cfg)
+
+    assert scored[const.COL_MUTATION_ID].tolist() == ["CAND0001", "CAND0002"]
+    assert scored[const.COL_PRIORITY_RANK].tolist() == [1, 2]
+    # The soft score really does favour the other one; only the gate reorders.
+    by_id = scored.set_index(const.COL_MUTATION_ID)[const.COL_PRIORITY_SCORE]
+    assert by_id["CAND0002"] > by_id["CAND0001"]
+
+
+def test_excluding_non_viable_shortens_the_pool(phase4_cfg: dict[str, Any]) -> None:
+    """``exclude_non_viable: true`` drops them entirely rather than demoting them."""
+    gate_cfg(
+        phase4_cfg, enabled=True, max_stability_ddG=0.0, min_functional_score=0.7,
+        exclude_non_viable=True,
+    )
+    df = make_scored(ddg=[-0.1, 0.5], func=[0.75, 1.0])
+
+    scored = pr.score_candidates(df, phase4_cfg)
+
+    assert scored[const.COL_MUTATION_ID].tolist() == ["CAND0001"]
+    assert scored[const.COL_IS_VIABLE].all()
+
+
+def test_ranking_is_contiguous_after_exclusion(phase4_cfg: dict[str, Any]) -> None:
+    """Ranks restart at 1 with no gaps once candidates have been removed."""
+    gate_cfg(
+        phase4_cfg, enabled=True, max_stability_ddG=0.0, min_functional_score=0.5,
+        exclude_non_viable=True,
+    )
+    df = make_scored(ddg=[-0.1, 5.0, -0.2, 5.0], func=[0.9, 0.9, 0.9, 0.1])
+
+    scored = pr.score_candidates(df, phase4_cfg)
+
+    assert scored[const.COL_PRIORITY_RANK].tolist() == list(range(1, len(scored) + 1))
+    assert len(scored) == 2
+
+
+def test_gate_status_reaches_the_shortlist_and_its_justification(
+    phase4_cfg: dict[str, Any],
+) -> None:
+    """The reported table carries the gate verdict, and the prose names it."""
+    gate_cfg(phase4_cfg, enabled=True, max_stability_ddG=0.0, min_functional_score=0.7)
+    phase4_cfg["prioritization"]["top_k"] = 2
+    df = make_scored(ddg=[-0.1, 0.5], func=[0.75, 1.0])
+    scored = pr.score_candidates(df, phase4_cfg)
+
+    report = pr.build_top_k(scored, phase4_cfg)
+
+    assert const.COL_VIABILITY in report.columns
+    assert report[const.COL_VIABILITY].tolist() == [
+        const.VIABILITY_PASS, const.VIABILITY_FAIL_STABILITY
+    ]
+    assert "clears both viability gates" in report[const.COL_JUSTIFICATION].iloc[0]
+    assert "stability gate" in report[const.COL_JUSTIFICATION].iloc[1]
+
+
+def test_markdown_states_how_many_candidates_are_viable(phase4_cfg: dict[str, Any]) -> None:
+    """A ten-row shortlist from a pool with few viable candidates must say so."""
+    gate_cfg(phase4_cfg, enabled=True, max_stability_ddG=0.0, min_functional_score=0.7)
+    df = make_scored(ddg=[-0.1, 0.5], func=[0.75, 1.0])
+    scored = pr.score_candidates(df, phase4_cfg)
+
+    lines = pr._viability_lines(scored, phase4_cfg)
+
+    assert lines and "1 of 2" in lines[0]
+    assert "not wet-lab ready" in lines[0]
+
+
+def test_shortlist_has_no_missing_values(phase4_cfg: dict[str, Any]) -> None:
+    """Every reported column is populated: a blank cell in a wet-lab handoff is a defect."""
+    scored, report = pr.run_prediction(phase4_cfg)
+
+    assert not report.isna().to_numpy().any()
+    for column in (
+        f"{const.PRED_PREFIX}{const.TARGET_STABILITY}",
+        f"{const.PRED_STD_PREFIX}{const.TARGET_STABILITY}",
+        f"{const.PRED_PREFIX}{const.TARGET_FUNCTION}",
+        f"{const.PRED_STD_PREFIX}{const.TARGET_FUNCTION}",
+        const.COL_TOTAL_UNCERTAINTY,
+        const.COL_PRIORITY_SCORE,
+    ):
+        values = report[column].to_numpy(dtype=float)
+        assert np.isfinite(values).all(), column
+    assert not scored.isna().to_numpy().any()
+
+
+def test_prediction_is_deterministic(phase4_cfg: dict[str, Any]) -> None:
+    """Two runs over the same artifacts give the same ranking, row for row."""
+    first_scored, first_report = pr.run_prediction(phase4_cfg)
+    second_scored, second_report = pr.run_prediction(phase4_cfg)
+
+    pd.testing.assert_frame_equal(first_report, second_report)
+    pd.testing.assert_frame_equal(first_scored, second_scored)

@@ -37,6 +37,7 @@ TEST_MAX_EPOCHS: int = 3    # the end-to-end test checks wiring, not convergence
 TEST_PATIENCE: int = 2
 TEST_BOTTLENECK_DIM: int = 4
 TEST_FUSION_DIM: int = 8
+TEST_ATTRIBUTION_REPEATS: int = 1
 
 
 # =============================================================================
@@ -80,6 +81,9 @@ def pipeline_cfg(cfg: dict[str, Any], raw_files: dict[str, Path]) -> dict[str, A
     cfg["torch_v2"]["batch_size"] = 8
     cfg["torch_v2"]["max_epochs"] = TEST_MAX_EPOCHS
     cfg["torch_v2"]["early_stopping"]["patience"] = TEST_PATIENCE
+    # Permutation importance costs one predict per feature per repeat per fold,
+    # so the end-to-end run uses the smallest setting that still produces a table.
+    cfg["attribution"]["n_repeats"] = TEST_ATTRIBUTION_REPEATS
     validate_config(cfg)
     return cfg
 
@@ -103,6 +107,7 @@ def test_stage_registry_is_in_dependency_order() -> None:
         "evaluate",
         "predict",
         "ablation",
+        "attribution",
         "interpret",
     ]
 
@@ -120,7 +125,7 @@ def test_requested_stages_are_reordered_canonically() -> None:
 def test_from_runs_the_stage_and_everything_after() -> None:
     """``--from`` resumes a pipeline without redoing the stages that have not changed."""
     assert main.resolve_stages(None, "evaluate") == [
-        "evaluate", "predict", "ablation", "interpret",
+        "evaluate", "predict", "ablation", "attribution", "interpret",
     ]
 
 
@@ -198,8 +203,11 @@ def test_full_pipeline_produces_every_deliverable(pipeline_cfg: dict[str, Any]) 
             "evaluation_markdown",
             "evaluation_json",
             "model_comparison",
-            "ablation_study",
-            "ablation_markdown",
+            "ablation_summary",
+            "ablation_summary_markdown",
+            "feature_importances",
+            "feature_group_importances",
+            "attribution_markdown",
             "torch_cv_metrics",
             "torch_history",
             "torch_fold_summary",
@@ -216,6 +224,8 @@ def test_full_pipeline_produces_every_deliverable(pipeline_cfg: dict[str, Any]) 
             *const.FIGURE_FILE_KEYS,
             *const.TORCH_FIGURE_FILE_KEYS,
             *const.TORCH_V2_FIGURE_FILE_KEYS,
+            *const.ABLATION_FIGURE_FILE_KEYS,
+            *const.ATTR_FIGURE_FILE_KEYS,
         ],
         "rankings_dir": [
             "all_predictions",

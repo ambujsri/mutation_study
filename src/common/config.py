@@ -25,6 +25,7 @@ from src.common.constants import (
     Activation,
     Bound,
     Encoding,
+    ImportanceKind,
     Imputation,
     Metric,
     ModelName,
@@ -54,7 +55,10 @@ _BOOLEAN_KEYS = (
     "torch_v2.standardize_stability_target",
     "torch_v2.save_fold_models",
     "torch_v2.embedding_pca",
+    "attribution.group_embeddings_as_block",
     "prioritization.ood_flag_unseen_family",
+    "prioritization.viability.enabled",
+    "prioritization.viability.exclude_non_viable",
     "models.refit_on_full_data",
     "models.save_fold_pipelines",
 )
@@ -284,6 +288,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
     errors.extend(_check_choice(cfg, "torch.activation", _enum_values(Activation)))
     errors.extend(_check_choice(cfg, "torch_v2.device", _enum_values(TorchDevice)))
     errors.extend(_check_choice(cfg, "torch_v2.activation", _enum_values(Activation)))
+    errors.extend(_check_choice(cfg, "attribution.scoring_metric", _enum_values(Metric)))
+    errors.extend(_check_subset(cfg, "attribution.kinds", _enum_values(ImportanceKind)))
     errors.extend(_check_torch_layers(cfg))
 
     candidates = get_by_path(cfg, "models.candidates", None)

@@ -294,6 +294,9 @@ CONFIG_BOUNDS: Final = MappingProxyType(
         "torch_v2.early_stopping.min_delta": Bound(0, None),
         "torch_v2.loss_weights.stability": Bound(0, None),
         "torch_v2.loss_weights.function": Bound(0, None),
+        "attribution.n_repeats": Bound(1, None, integer=True),
+        "attribution.top_k": Bound(1, None, integer=True),
+        "prioritization.viability.min_functional_score": Bound(0, 1),
         "models.candidates.ridge.alpha": Bound(0, None, low_open=True),
         "models.candidates.random_forest.n_estimators": Bound(1, None, integer=True),
         "models.candidates.random_forest.min_samples_leaf": Bound(1, None, integer=True),
@@ -389,6 +392,19 @@ OOD_UNSEEN_PROTEIN: Final = "unseen_protein"
 OOD_UNSEEN_FAMILY: Final = "unseen_family"
 
 # Columns of the Top-K report, in order. Embeddings are never reported.
+# Multi-objective viability gate (assignment Task 8). A candidate is viable
+# when it is predicted to stabilise AND to retain function; the two gates are
+# recorded separately so a near-miss can be told from a clear failure.
+COL_MEETS_STABILITY_GATE: Final = "meets_stability_gate"
+COL_MEETS_FUNCTION_GATE: Final = "meets_function_gate"
+COL_IS_VIABLE: Final = "is_viable"
+# Shown in the report instead of a bare boolean pair.
+VIABILITY_PASS: Final = "pass"
+VIABILITY_FAIL_STABILITY: Final = "fails_stability"
+VIABILITY_FAIL_FUNCTION: Final = "fails_function"
+VIABILITY_FAIL_BOTH: Final = "fails_both"
+COL_VIABILITY: Final = "viability"
+
 TOP_K_REPORT_COLUMNS: Final = (
     COL_PRIORITY_RANK,
     COL_MUTATION_ID,
@@ -407,6 +423,7 @@ TOP_K_REPORT_COLUMNS: Final = (
     f"{PRED_STD_PREFIX}{TARGET_FUNCTION}",
     COL_TOTAL_UNCERTAINTY,
     COL_PRIORITY_SCORE,
+    COL_VIABILITY,
     COL_OOD_FLAG,
     COL_JUSTIFICATION,
 )
@@ -576,6 +593,60 @@ ABL_COL_N_EMBEDDING: Final = "n_embedding"
 ABL_DELTA_PREFIX: Final = "delta_vs_baseline_"
 
 # =============================================================================
+# Feature attribution (assignment Task 7)
+# =============================================================================
+class ImportanceKind(str, Enum):
+    """How a feature's contribution is measured.
+
+    ``PERMUTATION`` scores a feature by how much the model degrades when that
+    column is shuffled on *held-out* rows, so it measures predictive value the
+    model actually realised out of sample. ``IMPURITY`` reads the tree
+    ensemble's internal split gains, which are computed on training rows and
+    are known to inflate high-cardinality features.
+    """
+
+    PERMUTATION = "permutation"
+    IMPURITY = "impurity"
+
+
+ATTR_COL_FEATURE: Final = "feature"
+ATTR_COL_GROUP: Final = "feature_group"
+ATTR_COL_KIND: Final = "importance_kind"
+ATTR_COL_MEAN: Final = "importance_mean"
+ATTR_COL_STD: Final = "importance_std"
+ATTR_COL_SHARE: Final = "importance_share"  # mean, normalised to sum to 1 per target
+ATTR_COL_RANK: Final = "rank"
+ATTR_COL_N_FOLDS: Final = "n_folds"
+# Importance is reported on the model's own inputs. After the fold-local PCA
+# the embedding block is no longer 256 named columns, so impurity importances
+# carry this prefix instead and are only interpretable in aggregate.
+ATTR_PCA_FEATURE_TEMPLATE: Final = "embedding_pc{index}"
+ATTR_FIGURE_FILE_KEYS: Final = ("fig_feature_importance", "fig_group_importance")
+# Bars are coloured by feature group, so the dominance of one group is legible
+# without cross-referencing the labels against the manifest.
+ATTR_GROUP_COLORS: Final = MappingProxyType(
+    {
+        GROUP_STRUCTURAL: "#1b7837",
+        GROUP_DELTAS: "#2166ac",
+        GROUP_PHYSICOCHEMICAL: "#8073ac",
+        GROUP_SEQUENCE: "#d95f02",
+        GROUP_EMBEDDINGS: "#999999",
+    }
+)
+ATTR_GROUP_UNKNOWN: Final = "unassigned"
+# Figure written by the ablation stage.
+ABLATION_FIGURE_FILE_KEYS: Final = ("fig_ablation_drop",)
+# Metrics the attribution figure and the report table lead with: a rank
+# correlation (what the shortlist is judged on) and a variance-explained score
+# (whether the magnitudes mean anything).
+ABL_HEADLINE_METRICS: Final = (Metric.SPEARMAN, Metric.R2)
+# Diverging bar colours: a subset that loses signal against the baseline and
+# one that gains it must be distinguishable without reading the axis.
+ABL_COLOR_LOSS: Final = "#b2182b"
+ABL_COLOR_GAIN: Final = "#2166ac"
+ABL_BAR_LABEL_PAD: Final = 0.004
+
+# =============================================================================
 # Infrastructure
 # =============================================================================
 LOG_FORMAT: Final = "%(asctime)s | %(levelname)s | %(name)s | %(message)s"
@@ -590,6 +661,7 @@ REQUIRED_CONFIG_SECTIONS: Final = (
     "models",
     "torch",
     "torch_v2",
+    "attribution",
     "evaluation",
     "ablation",
     "interpretation",

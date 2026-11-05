@@ -38,7 +38,7 @@ import pandas as pd
 from src.common import constants as const
 from src.common.config import DEFAULT_CONFIG_PATH, load_config, resolve_path, setup_logging
 from src.common.io import write_table
-from src.evaluate import compute_metrics
+from src.evaluate import compute_metrics, make_ablation_figures
 from src.model import FeatureSet
 from src.train import cross_validate_model, load_training_data
 from src.validation import generate_folds
@@ -229,28 +229,36 @@ def add_baseline_deltas(
 
 def to_markdown(table: pd.DataFrame, cfg: dict[str, Any]) -> str:
     """Render the ablation table as a Markdown section for the technical report."""
-    selection_metric = cfg["models"]["selection_metric"]
     baseline = cfg["ablation"]["baseline"]
     strategy = table[const.CV_COL_STRATEGY].iloc[0]
+    # Both headline metrics get a level and a delta: a rank correlation says
+    # whether the shortlist would be ordered correctly, R2 whether the
+    # predicted magnitudes mean anything. A feature group can matter for one
+    # and not the other, and reporting only the selection metric hides that.
     columns = [
         const.ABL_COL_SUBSET,
         const.ABL_COL_N_TABULAR,
         const.ABL_COL_N_EMBEDDING,
         f"{const.POOLED_PREFIX}{const.Metric.RMSE.value}",
-        f"{const.POOLED_PREFIX}{const.Metric.R2.value}",
-        f"{const.POOLED_PREFIX}{const.Metric.SPEARMAN.value}",
-        f"{const.ABL_DELTA_PREFIX}{selection_metric}",
+        *[f"{const.POOLED_PREFIX}{metric.value}" for metric in const.ABL_HEADLINE_METRICS],
+        f"{const.POOLED_PREFIX}{const.Metric.PEARSON.value}",
+        *[f"{const.ABL_DELTA_PREFIX}{metric.value}" for metric in const.ABL_HEADLINE_METRICS],
     ]
+    columns = [column for column in columns if column in table.columns]
     lines = [
         "# Feature-subset ablation",
         "",
         f"- Cross-validation: `{strategy}`, {int(table[const.COL_N_SAMPLES].iloc[0])} pooled "
         "out-of-fold predictions per row",
-        f"- Baseline for the delta column: `{baseline}`",
+        f"- Baseline for the delta columns: `{baseline}`",
         f"- Models: {dict(zip(table[const.COL_TARGET], table[const.COL_MODEL], strict=True))}",
         "",
         "Every subset is re-fitted from scratch inside each training fold, so differences are "
         "attributable to the feature columns alone; folds, seed and model are held fixed.",
+        "",
+        "A `delta_vs_baseline_` column is this subset's score minus the baseline's. For "
+        "`r2` and `spearman` a negative delta is a loss; the sign is left raw rather than "
+        "normalised so the column can be read straight against the level beside it.",
         "",
     ]
     for target in const.TARGETS.values():
@@ -267,15 +275,21 @@ def to_markdown(table: pd.DataFrame, cfg: dict[str, Any]) -> str:
 
 
 def export_artifacts(table: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Path]:
-    """Write the ablation table as CSV and Markdown.
+    """Write the ablation table as CSV and Markdown, plus the attribution figure.
 
     Returns:
         Mapping of artifact name to written path.
     """
-    paths = {key: resolve_path(cfg, "metrics_dir", key) for key in ("ablation_study", "ablation_markdown")}
-    write_table(table, paths["ablation_study"])
-    paths["ablation_markdown"].parent.mkdir(parents=True, exist_ok=True)
-    paths["ablation_markdown"].write_text(to_markdown(table, cfg), encoding=const.CONFIG_ENCODING)
+    paths = {
+        key: resolve_path(cfg, "metrics_dir", key)
+        for key in ("ablation_summary", "ablation_summary_markdown")
+    }
+    write_table(table, paths["ablation_summary"])
+    paths["ablation_summary_markdown"].parent.mkdir(parents=True, exist_ok=True)
+    paths["ablation_summary_markdown"].write_text(
+        to_markdown(table, cfg), encoding=const.CONFIG_ENCODING
+    )
+    paths.update(make_ablation_figures(table, cfg))
     for key, path in paths.items():
         logger.info("Wrote %s -> %s", key, path)
     return paths

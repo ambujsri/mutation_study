@@ -28,7 +28,7 @@ in name. The tabular columns vary from mutation to mutation within a protein —
 they are the only thing in the input that distinguishes one substitution of a
 given protein from another. The 256-d embedding is a *protein-level* vector:
 every mutation of the same protein carries an identical copy. The ablation in
-``results/metrics/ablation_study.md`` measures what that is worth under the
+``results/metrics/ablation_summary.md`` measures what that is worth under the
 family-grouped split: embeddings on their own score a **negative** rank
 correlation (-0.205 on stability, -0.110 on function), and adding all 256 of
 them on top of the full tabular set moves Spearman by +0.010 and +0.025. They
