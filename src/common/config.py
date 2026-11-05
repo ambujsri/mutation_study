@@ -56,6 +56,7 @@ _BOOLEAN_KEYS = (
     "torch_v2.save_fold_models",
     "torch_v2.embedding_pca",
     "attribution.group_embeddings_as_block",
+    "api.serve_figures",
     "prioritization.ood_flag_unseen_family",
     "prioritization.viability.enabled",
     "prioritization.viability.exclude_non_viable",

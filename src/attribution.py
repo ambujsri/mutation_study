@@ -50,6 +50,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+from abc import ABC, abstractmethod
 from pathlib import Path
 from typing import Any
 
@@ -143,89 +144,200 @@ def feature_group_of(name: str, units: dict[str, list[str]]) -> str:
 
 
 # =============================================================================
-# Permutation importance, on held-out fold rows
+# Importance strategies
 # =============================================================================
-def score_frame(
-    pipeline: Pipeline, frame: pd.DataFrame, y_true: np.ndarray, metric: const.Metric
-) -> float:
-    """Score a fitted pipeline on ``frame`` with one configured metric."""
-    predicted = np.asarray(pipeline.predict(frame), dtype=float)
-    return compute_metrics(y_true, predicted, [metric])[metric.value]
+class ImportanceStrategy(ABC):
+    """One way of scoring how much a model relies on each input.
 
+    The strategies differ in what they measure, what they are defined on, and
+    what they cost, so they are classes rather than branches on an enum:
+    adding SHAP means adding a subclass and an :class:`~src.common.constants.
+    ImportanceKind` member, with no existing code to edit.
 
-def permutation_importance_fold(
-    pipeline: Pipeline,
-    frame: pd.DataFrame,
-    y_true: np.ndarray,
-    units: dict[str, list[str]],
-    metric: const.Metric,
-    n_repeats: int,
-    seed: int,
-) -> dict[str, float]:
-    """Importance of every unit on one fold's validation rows.
-
-    Each unit's columns are shuffled together with a single permutation of the
-    row order, which preserves the correlations *within* the unit while
-    destroying its relationship to the target. The score is the mean drop
-    across ``n_repeats`` shuffles, signed so that **larger is always worse for
-    the model**, i.e. a larger value means the feature mattered more:
-
-        importance = baseline - permuted      (for r2, pearson, spearman)
-        importance = permuted - baseline      (for rmse, mae)
-
-    A small negative importance is expected noise, not a bug: shuffling an
-    unused column can improve the score by chance.
+    Attributes:
+        kind: The enum member this strategy implements, recorded in the
+            ``importance_kind`` column so a reader always knows which measure
+            produced a number.
     """
-    baseline = score_frame(pipeline, frame, y_true, metric)
-    higher_is_better = const.METRIC_GREATER_IS_BETTER[metric]
-    rng = np.random.default_rng(seed)
 
-    importances: dict[str, float] = {}
-    for unit, columns in units.items():
-        drops = []
-        for _ in range(n_repeats):
-            shuffled = frame.copy()
-            order = rng.permutation(len(shuffled))
-            # One row order for the whole unit: the block's internal structure
-            # survives, only its alignment with the target is broken.
-            shuffled[columns] = shuffled[columns].to_numpy()[order]
-            permuted = score_frame(pipeline, shuffled, y_true, metric)
-            drops.append(baseline - permuted if higher_is_better else permuted - baseline)
-        importances[unit] = float(np.mean(drops))
-    return importances
+    kind: const.ImportanceKind
+
+    def __init__(self, cfg: dict[str, Any], features: FeatureSet) -> None:
+        self.cfg = cfg
+        self.features = features
+
+    @abstractmethod
+    def score_fold(
+        self, pipeline: Pipeline, df: pd.DataFrame, fold: Fold, target: str
+    ) -> dict[str, float]:
+        """Importance of every unit for one fold. Empty when not applicable."""
+
+    def units(self) -> dict[str, list[str]]:
+        """Map each scored unit to the original columns behind it.
+
+        The default is one unit per original column, with the embedding block
+        optionally collapsed into one. A strategy defined on transformed
+        inputs overrides this.
+        """
+        return permutation_units(self.features, self.cfg)
 
 
-def impurity_importance_fold(pipeline: Pipeline, features: FeatureSet) -> dict[str, float]:
-    """Read the fitted estimator's built-in importances, if it has any.
+class PermutationImportance(ImportanceStrategy):
+    """Shuffle a column on held-out rows and measure the skill lost.
 
-    The names are the model's own inputs: the tabular columns in manifest
-    order, then one entry per PCA component. The components are *not* named
-    embedding columns, which is why they are labelled ``embedding_pc{i}``.
+    The honest measure, and the one the figures use: it is computed out of
+    sample, it is model-agnostic, and because the shuffle happens *before* the
+    pipeline, imputation, scaling and PCA all see the permuted column — so
+    importance is defined on the original named features rather than on
+    principal components.
 
-    Returns an empty mapping for an estimator without ``feature_importances_``
-    (Ridge, for instance), rather than substituting coefficients, which are
-    not on a comparable scale.
+    Its known weakness is correlated features: if two columns carry the same
+    information, shuffling either alone barely hurts and both look
+    unimportant. That is precisely why the embedding block is shuffled as one
+    unit.
     """
-    estimator = pipeline[-1]
-    raw = getattr(estimator, "feature_importances_", None)
-    if raw is None:
-        logger.info(
-            "%s exposes no feature_importances_; skipping impurity importance",
-            type(estimator).__name__,
+
+    kind = const.ImportanceKind.PERMUTATION
+
+    def score_fold(
+        self, pipeline: Pipeline, df: pd.DataFrame, fold: Fold, target: str
+    ) -> dict[str, float]:
+        """Score every unit on this fold's validation rows."""
+        section = self.cfg["attribution"]
+        rows = df.iloc[fold.val_idx]
+        return self.permute(
+            pipeline,
+            rows[self.features.all],
+            rows[target].to_numpy(dtype=float),
+            self.units(),
+            const.Metric(section["scoring_metric"]),
+            int(section["n_repeats"]),
+            # Fold-specific but deterministic: folds must not share a
+            # permutation order, and a re-run must reproduce it.
+            int(self.cfg["project"]["random_seed"]) + fold.index,
         )
-        return {}
-    values = np.asarray(raw, dtype=float)
-    n_reduced = values.size - len(features.tabular)
-    if n_reduced < 0:
-        raise ValueError(
-            f"Estimator reports {values.size} importances, fewer than the "
-            f"{len(features.tabular)} tabular columns it was given"
-        )
-    names = [
-        *features.tabular,
-        *[const.ATTR_PCA_FEATURE_TEMPLATE.format(index=i) for i in range(n_reduced)],
+
+    @staticmethod
+    def score_frame(
+        pipeline: Pipeline, frame: pd.DataFrame, y_true: np.ndarray, metric: const.Metric
+    ) -> float:
+        """Score a fitted pipeline on ``frame`` with one configured metric."""
+        predicted = np.asarray(pipeline.predict(frame), dtype=float)
+        return compute_metrics(y_true, predicted, [metric])[metric.value]
+
+    @classmethod
+    def permute(
+        cls,
+        pipeline: Pipeline,
+        frame: pd.DataFrame,
+        y_true: np.ndarray,
+        units: dict[str, list[str]],
+        metric: const.Metric,
+        n_repeats: int,
+        seed: int,
+    ) -> dict[str, float]:
+        """Importance of every unit on one set of held-out rows.
+
+        Each unit's columns are shuffled together under a single permutation
+        of the row order, which preserves the correlations *within* the unit
+        while destroying its relationship to the target. The score is the mean
+        drop across ``n_repeats`` shuffles, signed so that **larger is always
+        worse for the model**, i.e. larger means the feature mattered more::
+
+            importance = baseline - permuted      (r2, pearson, spearman)
+            importance = permuted - baseline      (rmse, mae)
+
+        A small negative importance is expected noise, not a bug: shuffling an
+        unused column can improve the score by chance.
+        """
+        baseline = cls.score_frame(pipeline, frame, y_true, metric)
+        higher_is_better = const.METRIC_GREATER_IS_BETTER[metric]
+        rng = np.random.default_rng(seed)
+
+        importances: dict[str, float] = {}
+        for unit, columns in units.items():
+            drops = []
+            for _ in range(n_repeats):
+                shuffled = frame.copy()
+                order = rng.permutation(len(shuffled))
+                shuffled[columns] = shuffled[columns].to_numpy()[order]
+                permuted = cls.score_frame(pipeline, shuffled, y_true, metric)
+                drops.append(baseline - permuted if higher_is_better else permuted - baseline)
+            importances[unit] = float(np.mean(drops))
+        return importances
+
+
+class ImpurityImportance(ImportanceStrategy):
+    """Read the tree ensemble's accumulated split gains.
+
+    Nearly free to compute, but measured on *training* rows and biased toward
+    features with many distinct values. It is also defined on the model's
+    **post-PCA** inputs, so its embedding entries are principal components
+    rather than named columns and mean little individually — which is why they
+    are labelled ``embedding_pc{i}`` and why this strategy overrides
+    :meth:`units`.
+    """
+
+    kind = const.ImportanceKind.IMPURITY
+
+    def units(self) -> dict[str, list[str]]:
+        """Tabular columns map to themselves; PCA components map to nothing.
+
+        A component is not any original column, so it is given an empty
+        membership list and falls through to the unassigned feature group,
+        rather than being misattributed to the embeddings it summarises.
+        """
+        return {column: [column] for column in self.features.tabular}
+
+    def score_fold(
+        self, pipeline: Pipeline, df: pd.DataFrame, fold: Fold, target: str
+    ) -> dict[str, float]:
+        """Read ``feature_importances_`` from the fitted estimator, if it has one.
+
+        Returns an empty mapping for an estimator without it (Ridge, for
+        instance) rather than substituting coefficients, which are not on a
+        comparable scale.
+
+        Raises:
+            ValueError: If the estimator reports fewer importances than the
+                tabular columns it was given, which would mean the names and
+                the values have come apart.
+        """
+        estimator = pipeline[-1]
+        raw = getattr(estimator, "feature_importances_", None)
+        if raw is None:
+            logger.info(
+                "%s exposes no feature_importances_; skipping impurity importance",
+                type(estimator).__name__,
+            )
+            return {}
+        values = np.asarray(raw, dtype=float)
+        n_reduced = values.size - len(self.features.tabular)
+        if n_reduced < 0:
+            raise ValueError(
+                f"Estimator reports {values.size} importances, fewer than the "
+                f"{len(self.features.tabular)} tabular columns it was given"
+            )
+        names = [
+            *self.features.tabular,
+            *[const.ATTR_PCA_FEATURE_TEMPLATE.format(index=i) for i in range(n_reduced)],
+        ]
+        return dict(zip(names, (float(v) for v in values), strict=True))
+
+
+# Enum member -> strategy. Adding a measure means adding a class and one line.
+STRATEGY_REGISTRY: dict[const.ImportanceKind, type[ImportanceStrategy]] = {
+    const.ImportanceKind.PERMUTATION: PermutationImportance,
+    const.ImportanceKind.IMPURITY: ImpurityImportance,
+}
+
+
+def build_strategies(cfg: dict[str, Any], features: FeatureSet) -> list[ImportanceStrategy]:
+    """Instantiate the strategies named in ``attribution.kinds``, in config order."""
+    return [
+        STRATEGY_REGISTRY[const.ImportanceKind(name)](cfg, features)
+        for name in cfg["attribution"]["kinds"]
     ]
-    return dict(zip(names, (float(v) for v in values), strict=True))
 
 
 # =============================================================================
@@ -303,71 +415,56 @@ def group_importances(table: pd.DataFrame) -> pd.DataFrame:
 def compute_attribution(cfg: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]:
     """Attribute the selected model's skill to its inputs, fold by fold.
 
+    The loop is strategy-agnostic: it asks each configured
+    :class:`ImportanceStrategy` for a per-fold score and aggregates whatever
+    comes back, so a new measure needs no change here.
+
     Returns:
         ``(per_feature, per_group)``. Both are empty only if no fold pipeline
         supports any configured importance kind.
     """
     df, features = load_training_data(cfg)
     pipelines = load_fold_pipelines(cfg)
+    strategies = build_strategies(cfg, features)
     section = cfg["attribution"]
-    kinds = [const.ImportanceKind(name) for name in section["kinds"]]
-    metric = const.Metric(section["scoring_metric"])
-    n_repeats = int(section["n_repeats"])
-    seed = int(cfg["project"]["random_seed"])
 
-    strategy = const.SplitStrategy(cfg["validation"]["primary_strategy"])
+    split = const.SplitStrategy(cfg["validation"]["primary_strategy"])
     validation = cfg["validation"]
     folds: list[Fold] = generate_folds(
-        df, strategy, validation["n_splits"], validation["shuffle"], seed
+        df, split, validation["n_splits"], validation["shuffle"],
+        int(cfg["project"]["random_seed"]),
     )
-    units = permutation_units(features, cfg)
     logger.info(
-        "Attributing %d permutation units over %d folds | kinds=%s | metric=%s | repeats=%d",
-        len(units),
+        "Attributing over %d folds | kinds=%s | metric=%s | repeats=%d",
         len(folds),
-        [kind.value for kind in kinds],
-        metric.value,
-        n_repeats,
+        [strategy.kind.value for strategy in strategies],
+        section["scoring_metric"],
+        int(section["n_repeats"]),
     )
 
     tables = []
     for target, fold_models in pipelines.items():
-        for kind in kinds:
+        for strategy in strategies:
             per_fold: dict[int, dict[str, float]] = {}
             for fold in folds:
                 pipeline = fold_models.get(fold.index)
                 if pipeline is None:
                     logger.warning("No %s pipeline for fold %d; skipping", target, fold.index)
                     continue
-                rows = df.iloc[fold.val_idx]
-                if kind is const.ImportanceKind.PERMUTATION:
-                    per_fold[fold.index] = permutation_importance_fold(
-                        pipeline,
-                        rows[features.all],
-                        rows[target].to_numpy(dtype=float),
-                        units,
-                        metric,
-                        n_repeats,
-                        # Fold-specific but deterministic: folds must not share
-                        # a permutation order, and a re-run must reproduce it.
-                        seed + fold.index,
-                    )
-                else:
-                    scores = impurity_importance_fold(pipeline, features)
-                    if scores:
-                        per_fold[fold.index] = scores
-            table = aggregate_folds(per_fold, target, kind, units)
+                scores = strategy.score_fold(pipeline, df, fold, target)
+                if scores:
+                    per_fold[fold.index] = scores
+            table = aggregate_folds(per_fold, target, strategy.kind, strategy.units())
             if table.empty:
                 continue
             tables.append(table)
-            top = table.head(3)
             logger.info(
                 "[%s|%s] top: %s",
                 target,
-                kind.value,
+                strategy.kind.value,
                 ", ".join(
                     f"{row[const.ATTR_COL_FEATURE]}={row[const.ATTR_COL_MEAN]:+.4f}"
-                    for _, row in top.iterrows()
+                    for _, row in table.head(3).iterrows()
                 ),
             )
     if not tables:

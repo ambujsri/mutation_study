@@ -21,6 +21,16 @@ ignore = [
 # The notebook must put the project root on sys.path before it can import src,
 # so its first-party imports cannot come first in the cell.
 "notebooks/*.ipynb" = ["E402"]
+# FastAPI's dependency injection is declared as a call in an argument default
+# (`service: ModelService = Depends(get_service)`). That is the framework's
+# documented idiom, not the mutable-default bug B008 exists to catch.
+# N815: `ddG` is the standard rendering of the free-energy change dG, and is
+# how the column is spelled in the dataset and every artifact. Lowercasing it
+# to `ddg` to satisfy a naming rule would make the field harder to join against
+# the CSVs and would read wrongly to the scientific audience.
+"src/api.py" = ["B008", "N815"]
+# The test module imports TestClient after importorskip, which must run first.
+"tests/test_api.py" = ["E402"]
 
 [tool.ruff.lint.pydocstyle]
 convention = "google"

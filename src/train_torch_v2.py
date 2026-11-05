@@ -55,361 +55,110 @@ import numpy as np
 import pandas as pd
 import torch
 from sklearn.compose import ColumnTransformer
-from torch import Tensor
-from torch.utils.data import DataLoader, TensorDataset
 
 from src.common import constants as const
 from src.common.config import DEFAULT_CONFIG_PATH, load_config, resolve_path, setup_logging
 from src.common.io import read_table, write_table
-from src.evaluate import compute_metrics, configured_metrics, make_torch_figures
+from src.evaluate import make_torch_figures
 from src.model import FeatureSet, build_preprocessor
-from src.torch_model import multitask_loss
 from src.torch_model_v2 import (
     DualBranchConfig,
     ProteinMutationDualBranchNN,
     count_branch_parameters,
     dual_branch_config_from,
 )
+from src.torch_training import FoldInputs, FoldResult, FoldTrainer
 from src.train import load_training_data
-from src.train_torch import TargetScaler, inner_split, seed_everything, to_tensor
 from src.train_torch import compare_with_baselines as compare_models
-from src.validation import Fold, generate_folds
+from src.validation import generate_folds
 
 logger = logging.getLogger(__name__)
 
 TARGET_STABILITY = const.TARGET_STABILITY
 TARGET_FUNCTION = const.TARGET_FUNCTION
 
-# Returned by train_one_fold: the model plus everything needed to reproduce its
-# inputs. The two preprocessors and the target scaler are only meaningful
-# together with the weights, so they travel as one object.
-FoldArtifacts = tuple[ProteinMutationDualBranchNN, ColumnTransformer, ColumnTransformer, TargetScaler]
-
 
 # =============================================================================
-# Fold-local preprocessing, one transformer per branch
+# The trainer
 # =============================================================================
-def build_branch_preprocessors(
-    cfg: dict[str, Any], features: FeatureSet, config: DualBranchConfig
-) -> tuple[ColumnTransformer, ColumnTransformer]:
-    """Build one preprocessor per branch.
+class DualBranchTrainer(FoldTrainer[DualBranchConfig, ProteinMutationDualBranchNN]):
+    """Fold-local trainer for the dual-branch network.
 
-    Both are assembled by :func:`src.model.build_preprocessor` from a
-    single-block :class:`~src.model.FeatureSet`, so the imputation strategy and
-    the scaler are exactly the ones every other model in the project uses.
-
-    The embedding block's PCA is governed by ``torch_v2.embedding_pca``: when
-    it is false the block's config is overridden locally so the raw embedding
-    reaches the learned bottleneck. The override is a shallow copy of the
-    reduction sub-dictionary, so the caller's config is left untouched.
-
-    Returns:
-        ``(tabular_preprocessor, embedding_preprocessor)``, both unfitted.
-
-    Raises:
-        ValueError: If either feature block is empty.
+    Shares every leakage rule and the whole epoch loop with
+    :class:`~src.train_torch.MultitaskTrainer` through :class:`FoldTrainer`.
+    What differs is only what this architecture needs: **two** fold-local
+    preprocessors instead of one, so the tabular block and the embedding block
+    reach the network as separate tensors, and a
+    :class:`~src.torch_model_v2.ProteinMutationDualBranchNN` to consume them.
     """
-    if not features.tabular or not features.embedding:
-        raise ValueError(
-            "The dual-branch model needs both feature blocks, got "
-            f"{len(features.tabular)} tabular and {len(features.embedding)} embedding columns"
-        )
-    tabular = build_preprocessor(cfg, FeatureSet(tabular=features.tabular, embedding=[]))
 
-    embedding_cfg = dict(cfg)
-    if not config.embedding_pca:
-        reduction = dict(cfg["features"]["embedding_reduction"])
-        reduction["enabled"] = False
-        embedding_cfg["features"] = {**cfg["features"], "embedding_reduction": reduction}
-    embedding = build_preprocessor(
-        embedding_cfg, FeatureSet(tabular=[], embedding=features.embedding)
-    )
-    return tabular, embedding
+    model_name = const.TORCH_V2_MODEL_NAME
 
+    def branch_preprocessors(self) -> tuple[ColumnTransformer, ColumnTransformer]:
+        """Build one unfitted preprocessor per branch.
 
-def make_loader(
-    tabular: Tensor,
-    embedding: Tensor,
-    y_stability: Tensor,
-    y_function: Tensor,
-    config: DualBranchConfig,
-    *,
-    shuffle: bool,
-) -> DataLoader[tuple[Tensor, ...]]:
-    """Wrap the two input blocks and both targets in a seeded, single-process loader.
+        Both are assembled by :func:`src.model.build_preprocessor` from a
+        single-block :class:`~src.model.FeatureSet`, so the imputation
+        strategy and the scaler are the ones every other model uses.
 
-    ``num_workers=0`` and an explicit generator keep batch order reproducible.
+        The embedding block's PCA is governed by ``torch_v2.embedding_pca``:
+        when it is false the block's config is overridden locally so the raw
+        embedding reaches the learned bottleneck. The override copies the
+        reduction sub-dictionary, leaving the caller's config untouched.
 
-    ``drop_last`` is enabled for shuffled (training) loaders because batch
-    normalisation cannot compute a batch variance from a single row: a training
-    fold whose size leaves a remainder of one would otherwise raise partway
-    through an epoch.
-    """
-    generator = torch.Generator()
-    generator.manual_seed(config.seed)
-    dataset = TensorDataset(tabular, embedding, y_stability, y_function)
-    drop_last = shuffle and len(dataset) % config.batch_size == 1
-    return DataLoader(
-        dataset,
-        batch_size=config.batch_size,
-        shuffle=shuffle,
-        generator=generator if shuffle else None,
-        num_workers=0,
-        drop_last=drop_last,
-    )
-
-
-# =============================================================================
-# Training one fold
-# =============================================================================
-def evaluate_loss(
-    model: ProteinMutationDualBranchNN,
-    loader: DataLoader[tuple[Tensor, ...]],
-    config: DualBranchConfig,
-) -> float:
-    """Mean weighted multitask loss over a loader, with the model in eval mode."""
-    model.eval()
-    total, n_rows = 0.0, 0
-    with torch.no_grad():
-        for tabular, embedding, y_stability, y_function in loader:
-            loss, _, _ = multitask_loss(
-                model(tabular, embedding), (y_stability, y_function), config.loss_weights
+        Raises:
+            ValueError: If either feature block is empty.
+        """
+        features, cfg = self.features, self.cfg
+        if not features.tabular or not features.embedding:
+            raise ValueError(
+                "The dual-branch model needs both feature blocks, got "
+                f"{len(features.tabular)} tabular and {len(features.embedding)} embedding columns"
             )
-            total += loss.item() * tabular.shape[0]
-            n_rows += tabular.shape[0]
-    return total / max(n_rows, 1)
+        tabular = build_preprocessor(cfg, FeatureSet(tabular=features.tabular, embedding=[]))
 
+        embedding_cfg = dict(cfg)
+        if not self.config.embedding_pca:
+            reduction = dict(cfg["features"]["embedding_reduction"])
+            reduction["enabled"] = False
+            embedding_cfg["features"] = {**cfg["features"], "embedding_reduction": reduction}
+        embedding = build_preprocessor(
+            embedding_cfg, FeatureSet(tabular=[], embedding=features.embedding)
+        )
+        return tabular, embedding
 
-def train_one_fold(
-    df: pd.DataFrame,
-    fold: Fold,
-    features: FeatureSet,
-    cfg: dict[str, Any],
-    config: DualBranchConfig,
-) -> tuple[FoldArtifacts, pd.DataFrame, dict[str, Any]]:
-    """Fit the dual-branch network on one fold, early-stopping on an inner split.
+    def fit_fold_inputs(
+        self, df: pd.DataFrame, inner_train_idx: np.ndarray, inner_val_idx: np.ndarray
+    ) -> FoldInputs:
+        """Fit both preprocessors on the inner-training rows.
 
-    Returns:
-        ``(artifacts, history, summary)`` where ``history`` has one row per
-        epoch and ``summary`` records the stopping behaviour for the
-        provenance table.
-    """
-    seed_everything(config.seed)
-    inner_train_idx, inner_val_idx = inner_split(df, fold.train_idx, fold.strategy, config)
-
-    tabular_pre, embedding_pre = build_branch_preprocessors(cfg, features, config)
-    tabular_frame, embedding_frame = df[features.tabular], df[features.embedding]
-    x_tab_train = tabular_pre.fit_transform(tabular_frame.iloc[inner_train_idx])
-    x_emb_train = embedding_pre.fit_transform(embedding_frame.iloc[inner_train_idx])
-    x_tab_val = tabular_pre.transform(tabular_frame.iloc[inner_val_idx])
-    x_emb_val = embedding_pre.transform(embedding_frame.iloc[inner_val_idx])
-
-    scaler = TargetScaler(enabled=config.standardize_stability_target)
-    scaler.fit(df[TARGET_STABILITY].to_numpy(dtype=float)[inner_train_idx])
-
-    def targets(idx: np.ndarray) -> tuple[Tensor, Tensor]:
-        stability = scaler.transform(df[TARGET_STABILITY].to_numpy(dtype=float)[idx])
-        function = df[TARGET_FUNCTION].to_numpy(dtype=float)[idx]
-        return to_tensor(stability, config.device), to_tensor(function, config.device)
-
-    train_loader = make_loader(
-        to_tensor(x_tab_train, config.device),
-        to_tensor(x_emb_train, config.device),
-        *targets(inner_train_idx),
-        config,
-        shuffle=True,
-    )
-    val_loader = make_loader(
-        to_tensor(x_tab_val, config.device),
-        to_tensor(x_emb_val, config.device),
-        *targets(inner_val_idx),
-        config,
-        shuffle=False,
-    )
-
-    model = ProteinMutationDualBranchNN(
-        x_tab_train.shape[1], x_emb_train.shape[1], config
-    ).to(config.device)
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
-    )
-
-    best_loss, best_epoch = float("inf"), 0
-    best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-    records: list[dict[str, Any]] = []
-    epochs_without_gain = 0
-    for epoch in range(1, config.max_epochs + 1):
-        model.train()
-        running, n_rows = 0.0, 0
-        for batch_tab, batch_emb, batch_stability, batch_function in train_loader:
-            optimizer.zero_grad(set_to_none=True)
-            loss, _, _ = multitask_loss(
-                model(batch_tab, batch_emb),
-                (batch_stability, batch_function),
-                config.loss_weights,
-            )
-            loss.backward()
-            optimizer.step()
-            running += loss.detach().item() * batch_tab.shape[0]
-            n_rows += batch_tab.shape[0]
-        train_loss = running / max(n_rows, 1)
-        val_loss = evaluate_loss(model, val_loader, config)
-        records.append(
-            {
-                const.CV_COL_STRATEGY: fold.strategy.value,
-                const.CV_COL_FOLD: fold.index,
-                const.TORCH_COL_EPOCH: epoch,
-                const.TORCH_COL_TRAIN_LOSS: train_loss,
-                const.TORCH_COL_VAL_LOSS: val_loss,
-            }
+        The leakage guarantee is unchanged from the single-block case; it is
+        simply enforced twice instead of once.
+        """
+        tabular_pre, embedding_pre = self.branch_preprocessors()
+        tabular_frame = df[self.features.tabular]
+        embedding_frame = df[self.features.embedding]
+        train = (
+            tabular_pre.fit_transform(tabular_frame.iloc[inner_train_idx]),
+            embedding_pre.fit_transform(embedding_frame.iloc[inner_train_idx]),
+        )
+        val = (
+            tabular_pre.transform(tabular_frame.iloc[inner_val_idx]),
+            embedding_pre.transform(embedding_frame.iloc[inner_val_idx]),
+        )
+        return FoldInputs(
+            train=train,
+            val=val,
+            transform=lambda frame: (
+                tabular_pre.transform(frame[self.features.tabular]),
+                embedding_pre.transform(frame[self.features.embedding]),
+            ),
+            fitted=(tabular_pre, embedding_pre),
         )
 
-        if val_loss < best_loss - config.min_delta:
-            best_loss, best_epoch, epochs_without_gain = val_loss, epoch, 0
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        else:
-            epochs_without_gain += 1
-            if epochs_without_gain >= config.patience:
-                break
-
-    # Always report the best epoch's network, not the last one's.
-    model.load_state_dict(best_state)
-    summary = {
-        const.CV_COL_STRATEGY: fold.strategy.value,
-        const.CV_COL_FOLD: fold.index,
-        const.TORCH_COL_BEST_EPOCH: best_epoch,
-        const.TORCH_COL_STOPPED_EPOCH: records[-1][const.TORCH_COL_EPOCH],
-        const.TORCH_COL_VAL_LOSS: best_loss,
-        const.TORCH_COL_N_INNER_TRAIN: int(inner_train_idx.size),
-        const.TORCH_COL_N_INNER_VAL: int(inner_val_idx.size),
-    }
-    logger.info(
-        "[%s] fold %d: best epoch %d/%d (val loss %.5f), inner split %d/%d, inputs %d+%d",
-        fold.strategy.value,
-        fold.index,
-        best_epoch,
-        summary[const.TORCH_COL_STOPPED_EPOCH],
-        best_loss,
-        inner_train_idx.size,
-        inner_val_idx.size,
-        x_tab_train.shape[1],
-        x_emb_train.shape[1],
-    )
-    return (model, tabular_pre, embedding_pre, scaler), pd.DataFrame(records), summary
-
-
-def predict_rows(
-    artifacts: FoldArtifacts,
-    frame: pd.DataFrame,
-    features: FeatureSet,
-    config: DualBranchConfig,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Predict both targets for ``frame``, returning stability in kcal/mol."""
-    model, tabular_pre, embedding_pre, scaler = artifacts
-    model.eval()
-    tabular = to_tensor(tabular_pre.transform(frame[features.tabular]), config.device)
-    embedding = to_tensor(embedding_pre.transform(frame[features.embedding]), config.device)
-    with torch.no_grad():
-        stability, function = model(tabular, embedding)
-    return (
-        scaler.inverse_transform(stability.cpu().numpy().astype(float)),
-        function.cpu().numpy().astype(float),
-    )
-
-
-# =============================================================================
-# Cross-validation
-# =============================================================================
-def cross_validate_dual_branch(
-    df: pd.DataFrame,
-    folds: list[Fold],
-    features: FeatureSet,
-    cfg: dict[str, Any],
-    config: DualBranchConfig,
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[int, FoldArtifacts]]:
-    """Train and score the dual-branch network on every fold.
-
-    Returns:
-        ``(oof, history, fold_summary, artifacts)``. ``oof`` uses the same long
-        schema as every other model, so the tables concatenate.
-    """
-    oof_frames, histories, summaries = [], [], []
-    artifacts: dict[int, FoldArtifacts] = {}
-    for fold in folds:
-        fold_artifacts, history, summary = train_one_fold(df, fold, features, cfg, config)
-        val_rows = df.iloc[fold.val_idx]
-        stability, function = predict_rows(fold_artifacts, val_rows, features, config)
-
-        for target, predicted in ((TARGET_STABILITY, stability), (TARGET_FUNCTION, function)):
-            oof_frames.append(
-                pd.DataFrame(
-                    {
-                        const.COL_MUTATION_ID: val_rows[const.COL_MUTATION_ID].to_numpy(),
-                        const.COL_PROTEIN_ID: val_rows[const.COL_PROTEIN_ID].to_numpy(),
-                        const.COL_PROTEIN_FAMILY: val_rows[const.COL_PROTEIN_FAMILY].to_numpy(),
-                        const.CV_COL_STRATEGY: fold.strategy.value,
-                        const.COL_MODEL: const.TORCH_V2_MODEL_NAME,
-                        const.COL_TARGET: target,
-                        const.CV_COL_FOLD: fold.index,
-                        const.COL_Y_TRUE: val_rows[target].to_numpy(dtype=float),
-                        const.COL_Y_PRED: predicted,
-                    }
-                )
-            )
-        histories.append(history)
-        summaries.append(summary)
-        artifacts[fold.index] = fold_artifacts
-    return (
-        pd.concat(oof_frames, ignore_index=True),
-        pd.concat(histories, ignore_index=True),
-        pd.DataFrame(summaries),
-        artifacts,
-    )
-
-
-def summarize_metrics(oof: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
-    """Pooled out-of-fold metrics per target, plus the per-fold spread."""
-    metrics = configured_metrics(cfg)
-    rows = []
-    for (strategy, target), group in oof.groupby(
-        [const.CV_COL_STRATEGY, const.COL_TARGET], sort=False
-    ):
-        pooled = compute_metrics(
-            group[const.COL_Y_TRUE].to_numpy(), group[const.COL_Y_PRED].to_numpy(), metrics
-        )
-        fold_table = pd.DataFrame(
-            [
-                compute_metrics(
-                    f[const.COL_Y_TRUE].to_numpy(), f[const.COL_Y_PRED].to_numpy(), metrics
-                )
-                for _, f in group.groupby(const.CV_COL_FOLD, sort=True)
-            ]
-        )
-        rows.append(
-            {
-                const.CV_COL_STRATEGY: strategy,
-                const.COL_MODEL: const.TORCH_V2_MODEL_NAME,
-                const.COL_TARGET: target,
-                const.COL_N_SAMPLES: len(group),
-                **{f"{const.POOLED_PREFIX}{k}": v for k, v in pooled.items()},
-                **{
-                    f"{const.FOLD_MEAN_PREFIX}{m.value}": float(fold_table[m.value].mean())
-                    for m in metrics
-                },
-                **{
-                    f"{const.FOLD_STD_PREFIX}{m.value}": float(fold_table[m.value].std())
-                    for m in metrics
-                },
-            }
-        )
-        logger.info(
-            "[%s|%s|%s] pooled OOF: %s",
-            strategy,
-            const.TORCH_V2_MODEL_NAME,
-            target,
-            ", ".join(f"{k}={v:.3f}" for k, v in pooled.items()),
-        )
-    return pd.DataFrame(rows)
+    def build_model(self, widths: tuple[int, ...]) -> ProteinMutationDualBranchNN:
+        """Construct the dual-branch network for the tabular and embedding widths."""
+        return ProteinMutationDualBranchNN(widths[0], widths[1], self.config)
 
 
 def first_network_metrics(cfg: dict[str, Any]) -> pd.DataFrame:
@@ -468,7 +217,7 @@ def save_artifacts(
     history: pd.DataFrame,
     fold_summary: pd.DataFrame,
     comparison: pd.DataFrame,
-    artifacts: dict[int, FoldArtifacts],
+    artifacts: dict[int, FoldResult[ProteinMutationDualBranchNN]],
     features: FeatureSet,
     cfg: dict[str, Any],
     config: DualBranchConfig,
@@ -506,7 +255,9 @@ def save_artifacts(
     models_dir.mkdir(parents=True, exist_ok=True)
     saved_folds: list[str] = []
     if config.save_fold_models:
-        for index, (model, tabular_pre, embedding_pre, _) in sorted(artifacts.items()):
+        for index, result in sorted(artifacts.items()):
+            model = result.model
+            tabular_pre, embedding_pre = result.inputs.fitted
             strategy = cfg["validation"]["primary_strategy"]
             names = {
                 "weights": const.TORCH_V2_FOLD_MODEL_TEMPLATE,
@@ -523,7 +274,7 @@ def save_artifacts(
             saved_folds.append(resolved["weights"].name)
         paths["torch_v2_fold_models"] = models_dir
 
-    example = next(iter(artifacts.values()))[0] if artifacts else None
+    example = next(iter(artifacts.values())).model if artifacts else None
     metadata: dict[str, Any] = {
         "model": const.TORCH_V2_MODEL_NAME,
         "random_seed": config.seed,
@@ -598,10 +349,9 @@ def run_dual_branch_training(cfg: dict[str, Any]) -> tuple[pd.DataFrame, pd.Data
         *config.loss_weights,
     )
 
-    oof, history, fold_summary, artifacts = cross_validate_dual_branch(
-        df, folds, features, cfg, config
-    )
-    summary = summarize_metrics(oof, cfg)
+    trainer = DualBranchTrainer(cfg, config, features)
+    oof, history, fold_summary, artifacts = trainer.cross_validate(df, folds)
+    summary = trainer.summarize(oof)
     comparison = compare_models(
         summary,
         cfg,

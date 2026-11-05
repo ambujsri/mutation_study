@@ -4,6 +4,7 @@ ruff==0.14.10
 mypy==1.17.1
 pytest==8.4.2
 types-PyYAML==6.0.12.20250915
+httpx==0.28.1             # required by fastapi.testclient for tests/test_api.py
 
 # Deliverable build tooling (not imported by the pipeline).
 reportlab==5.0.1          # report/build_pdf.py -> report/final_report.pdf

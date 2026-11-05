@@ -93,10 +93,38 @@ Homebrew/PyPI build.
 Checks:
 
 ```bash
-python -m pytest -q        # 765 tests
+python -m pytest -q        # 786 tests (test_api.py skips without the web deps)
 python -m ruff check .
 python -m mypy src main.py
 ```
+
+## HTTP API
+
+The trained model is also callable over HTTP, for Postman, curl or any client:
+
+```bash
+pip install -r requirements.txt          # adds fastapi, uvicorn, pydantic
+python -m src.api --config config/config.yaml
+```
+
+| method | path | purpose |
+|:-------|:-----|:--------|
+| GET  | `/health`         | liveness + whether the model loaded |
+| GET  | `/model`          | selected models, CV strategy, seed, versions |
+| POST | `/predict`        | score mutations: predictions, uncertainty, OOD, viability |
+| POST | `/prioritize`     | score and rank, returning the Top-K with justifications |
+| GET  | `/metrics/{name}` | a published metrics table as JSON |
+| GET  | `/figures/{key}`  | a generated PNG |
+| GET  | `/docs`           | interactive schema |
+
+`http://127.0.0.1:8000/openapi.json` imports into Postman as a complete
+collection. A ready-made request body is in
+[docs/api/example_request.json](docs/api/example_request.json).
+
+**Training is not exposed.** A request that blocks for minutes and mutates
+shared artifacts is a batch job with an HTTP trigger, not an API; two
+concurrent callers would corrupt each other's run. Training stays
+`python main.py`, and the service reads what it produced.
 
 ## Model architecture
 
@@ -204,11 +232,14 @@ src/data_processing.py          Ingestion, merge with embeddings, anomaly checks
 src/model.py                    Model architectures: feature blocks, pipelines, registry
 src/validation.py               Random vs. protein-group vs. family-group CV
 src/train.py                    Fold-wise training, model selection, artifacts
-src/evaluate.py                 Metrics, family/strategy comparison, optimism gap, figures
+src/evaluate.py                 Metrics, family/strategy comparison, optimism gap, reports
+src/figures.py                  Every figure, as Figure subclasses with a shared renderer
+src/api.py                      HTTP service over the trained model (FastAPI)
 src/torch_model.py              Multitask network: shared backbone, two task heads
-src/train_torch.py              Fold-local network training, early stopping, benchmark
+src/torch_training.py           FoldTrainer: the epoch loop and leakage rules, shared
+src/train_torch.py              MultitaskTrainer: one input block, plus artifacts
 src/torch_model_v2.py           Dual-branch network: separate branches, residual fusion
-src/train_torch_v2.py           Fold-local dual-branch training, two branch preprocessors
+src/train_torch_v2.py           DualBranchTrainer: two input blocks, plus artifacts
 src/predict.py                  Ensemble inference, uncertainty, viability gate, OOD flags, Top 10
 src/ablation.py                 Feature-subset ablation study and attribution figure
 src/attribution.py              Permutation and impurity feature importance (Task 7)
@@ -222,7 +253,7 @@ results/models/                 Fitted pipelines, network weights, provenance me
 report/final_report.md          Source for the 6-page technical report
 report/final_report.pdf         The report deliverable (built by report/build_pdf.py)
 report/final_report_full.md     Extended version: full derivations, all candidate write-ups
-tests/                          765 tests, mirroring src/
+tests/                          786 tests, mirroring src/
 main.py                         End-to-end orchestration
 docs/CODING_GUIDELINES.md       Standards every change must follow
 ```

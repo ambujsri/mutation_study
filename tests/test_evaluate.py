@@ -27,6 +27,7 @@ import pytest
 
 from src import data_processing as pp
 from src import evaluate as ev
+from src import figures as fg
 from src import train as tr
 from src.common import constants as const
 from src.common.config import validate_config
@@ -591,23 +592,48 @@ def test_torch_figures_skip_the_overlay_without_baselines(
 def test_learning_curves_draw_one_panel_per_fold(
     trained_cfg: dict[str, Any], torch_frames: dict[str, pd.DataFrame]
 ) -> None:
-    """Every fold in the history gets a panel, and the kept epoch is annotated."""
-    path = Path(trained_cfg["paths"]["figures_dir"], trained_cfg["files"]["fig_torch_learning_curves"])
+    """Every fold in the history gets a panel, and the figure knows its own path."""
+    figure = fg.LearningCurves(
+        torch_frames["history"], torch_frames["fold_summary"], trained_cfg,
+        "fig_torch_learning_curves",
+    )
 
-    written = ev.plot_learning_curves(torch_frames["history"], torch_frames["fold_summary"], path, 60)
+    written = figure.render()
 
-    assert written == path and path.is_file()
+    expected = Path(
+        trained_cfg["paths"]["figures_dir"], trained_cfg["files"]["fig_torch_learning_curves"]
+    )
+    assert written == expected == figure.path
+    assert expected.is_file()
 
 
 def test_learning_curves_tolerate_a_missing_fold_summary(
     trained_cfg: dict[str, Any], torch_frames: dict[str, pd.DataFrame]
 ) -> None:
     """Without the early-stopping record the curves still plot, just unannotated."""
-    path = Path(trained_cfg["paths"]["figures_dir"], trained_cfg["files"]["fig_torch_learning_curves"])
+    figure = fg.LearningCurves(
+        torch_frames["history"], pd.DataFrame(), trained_cfg, "fig_torch_learning_curves"
+    )
 
-    written = ev.plot_learning_curves(torch_frames["history"], pd.DataFrame(), path, 60)
+    written = figure.render()
 
+    assert written is not None
     assert written.is_file() and written.stat().st_size > 0
+
+
+def test_a_figure_with_nothing_to_draw_is_skipped(trained_cfg: dict[str, Any]) -> None:
+    """``is_drawable`` short-circuits render, so no blank image is written.
+
+    A blank PNG in the results directory would read as a result; an absent
+    one reads as "this stage had no input", which is the truth.
+    """
+    figure = fg.LearningCurves(
+        pd.DataFrame(), pd.DataFrame(), trained_cfg, "fig_torch_learning_curves"
+    )
+
+    assert figure.is_drawable() is False
+    assert figure.render() is None
+    assert not figure.path.exists()
 
 
 # =============================================================================

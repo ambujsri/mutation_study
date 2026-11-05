@@ -297,6 +297,8 @@ CONFIG_BOUNDS: Final = MappingProxyType(
         "attribution.n_repeats": Bound(1, None, integer=True),
         "attribution.top_k": Bound(1, None, integer=True),
         "prioritization.viability.min_functional_score": Bound(0, 1),
+        "api.port": Bound(1, 65535, integer=True),
+        "api.max_batch_size": Bound(1, None, integer=True),
         "models.candidates.ridge.alpha": Bound(0, None, low_open=True),
         "models.candidates.random_forest.n_estimators": Bound(1, None, integer=True),
         "models.candidates.random_forest.min_samples_leaf": Bound(1, None, integer=True),
@@ -636,6 +638,30 @@ ATTR_GROUP_COLORS: Final = MappingProxyType(
 ATTR_GROUP_UNKNOWN: Final = "unassigned"
 # Figure written by the ablation stage.
 ABLATION_FIGURE_FILE_KEYS: Final = ("fig_ablation_drop",)
+
+# =============================================================================
+# HTTP service (src/api.py)
+# =============================================================================
+API_PREDICT_PATH: Final = "/predict"
+API_PRIORITIZE_PATH: Final = "/prioritize"
+API_HEALTH_PATH: Final = "/health"
+API_MODEL_PATH: Final = "/model"
+API_METRICS_PATH: Final = "/metrics"
+API_FIGURES_PATH: Final = "/figures"
+# Metrics artifacts the service will serve, by their config `files` key. An
+# allowlist, so a path parameter cannot be used to read arbitrary files.
+API_SERVABLE_METRICS: Final = (
+    "cv_metrics_summary",
+    "model_comparison",
+    "baseline_benchmark",
+    "ablation_summary",
+    "feature_importances",
+    "feature_group_importances",
+    "torch_comparison",
+    "torch_v2_comparison",
+)
+API_STATUS_OK: Final = "ok"
+API_STATUS_DEGRADED: Final = "degraded"
 # Metrics the attribution figure and the report table lead with: a rank
 # correlation (what the shortlist is judged on) and a variance-explained score
 # (whether the magnitudes mean anything).
@@ -662,6 +688,7 @@ REQUIRED_CONFIG_SECTIONS: Final = (
     "torch",
     "torch_v2",
     "attribution",
+    "api",
     "evaluation",
     "ablation",
     "interpretation",

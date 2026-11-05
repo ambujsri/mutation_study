@@ -200,7 +200,7 @@ def test_a_used_feature_outscores_an_ignored_one(
     units = {column: [column] for column in features.tabular}
     units["unused_constant"] = ["unused_constant"]
 
-    scores = at.permutation_importance_fold(
+    scores = at.PermutationImportance.permute(
         pipelines[target][fold.index],
         rows,
         df.iloc[fold.val_idx][target].to_numpy(dtype=float),
@@ -233,7 +233,7 @@ def test_importance_sign_is_normalised_across_metric_polarity(
     units = {column: [column] for column in features.tabular}
 
     scored = {
-        metric: at.permutation_importance_fold(
+        metric: at.PermutationImportance.permute(
             pipelines[target][fold.index], rows, y_true, units, metric, TEST_N_REPEATS,
             attribution_cfg["project"]["random_seed"],
         )
@@ -246,13 +246,16 @@ def test_importance_sign_is_normalised_across_metric_polarity(
 
 
 def test_impurity_names_pca_components_separately(
+    attribution_cfg: dict[str, Any],
     first_fold: tuple[pd.DataFrame, FeatureSet, Any, Any],
 ) -> None:
     """Post-PCA inputs are labelled as components, never as embedding column names."""
-    _, features, _, pipelines = first_fold
-    pipeline = pipelines[const.TARGET_STABILITY][0]
+    df, features, fold, pipelines = first_fold
+    strategy = at.ImpurityImportance(attribution_cfg, features)
 
-    scores = at.impurity_importance_fold(pipeline, features)
+    scores = strategy.score_fold(
+        pipelines[const.TARGET_STABILITY][0], df, fold, const.TARGET_STABILITY
+    )
 
     assert set(features.tabular) <= set(scores)
     components = [name for name in scores if name.startswith("embedding_pc")]
@@ -260,11 +263,34 @@ def test_impurity_names_pca_components_separately(
     assert not set(features.embedding) & set(scores)
 
 
-def test_impurity_is_skipped_for_an_estimator_without_it() -> None:
+def test_impurity_is_skipped_for_an_estimator_without_it(
+    attribution_cfg: dict[str, Any],
+    first_fold: tuple[pd.DataFrame, FeatureSet, Any, Any],
+) -> None:
     """Ridge has no feature_importances_; coefficients are not substituted for them."""
+    df, _, fold, _ = first_fold
+    strategy = at.ImpurityImportance(attribution_cfg, FeatureSet(["a"], []))
     pipeline = Pipeline([("model", Ridge())])
 
-    assert at.impurity_importance_fold(pipeline, FeatureSet(["a"], [])) == {}
+    assert strategy.score_fold(pipeline, df, fold, const.TARGET_STABILITY) == {}
+
+
+def test_every_configured_kind_becomes_a_strategy(attribution_cfg: dict[str, Any]) -> None:
+    """``attribution.kinds`` drives which strategies run, in the order declared."""
+    _, features = at.load_training_data(attribution_cfg)
+
+    strategies = at.build_strategies(attribution_cfg, features)
+
+    assert [s.kind.value for s in strategies] == attribution_cfg["attribution"]["kinds"]
+    assert all(isinstance(s, at.ImportanceStrategy) for s in strategies)
+
+
+def test_the_registry_covers_every_importance_kind() -> None:
+    """A new ImportanceKind without a strategy would fail at run time, not import.
+
+    Pinned here so the gap is caught by the suite instead of by a user.
+    """
+    assert set(at.STRATEGY_REGISTRY) == set(const.ImportanceKind)
 
 
 # =============================================================================

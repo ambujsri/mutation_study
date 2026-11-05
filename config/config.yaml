@@ -233,6 +233,25 @@ torch_v2:
   save_fold_models: true
 
 # -----------------------------------------------------------------------------
+# HTTP service (src/api.py)
+# Serves the ALREADY-TRAINED model. Training stays a command-line pipeline:
+# a request that blocks for minutes and mutates shared artifacts is not an API.
+# -----------------------------------------------------------------------------
+api:
+  host: 127.0.0.1                        # 0.0.0.0 to accept off-box traffic
+  port: 8000
+  title: Protein Mutation Effect API
+  # Reject oversized batches rather than letting one request monopolise the
+  # process; the model is loaded once and shared, so there is no parallelism.
+  max_batch_size: 500
+  # Browser origins allowed to call the API. Empty = none, which is correct
+  # for Postman and curl; add origins only when a web front end needs them.
+  cors_allow_origins: []
+  # Serve the generated PNGs over HTTP. Off by default: the figures directory
+  # is not a public asset store.
+  serve_figures: true
+
+# -----------------------------------------------------------------------------
 # Feature attribution (src/attribution.py, assignment Task 7)
 # Explains the SELECTED model: which inputs it actually used, measured on
 # held-out fold rows rather than on the rows it was fitted to.

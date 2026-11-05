@@ -39,425 +39,73 @@ import argparse
 import json
 import logging
 import platform
-import random
 from pathlib import Path
-from typing import Any, Protocol
+from typing import Any
 
 import joblib
 import numpy as np
 import pandas as pd
 import torch
-from sklearn.compose import ColumnTransformer
-from sklearn.model_selection import GroupShuffleSplit, ShuffleSplit
-from torch import Tensor
-from torch.utils.data import DataLoader, TensorDataset
 
 from src.common import constants as const
 from src.common.config import DEFAULT_CONFIG_PATH, load_config, resolve_path, setup_logging
 from src.common.io import read_table, write_table
-from src.evaluate import compute_metrics, configured_metrics, make_torch_figures
+from src.evaluate import configured_metrics, make_torch_figures
 from src.model import FeatureSet, build_preprocessor
 from src.torch_model import (
     ProteinMutationMultitaskNN,
     TorchConfig,
     count_parameters,
-    multitask_loss,
     torch_config_from,
 )
+from src.torch_training import FoldInputs, FoldResult, FoldTrainer
 from src.train import load_training_data
-from src.validation import Fold, generate_folds, group_labels
+from src.validation import generate_folds
 
 logger = logging.getLogger(__name__)
 
 TARGET_STABILITY = const.TARGET_STABILITY
 TARGET_FUNCTION = const.TARGET_FUNCTION
 
-
 # =============================================================================
-# Reproducibility
+# The trainer
 # =============================================================================
-def seed_everything(seed: int) -> None:
-    """Seed Python, NumPy and Torch, and ask Torch for deterministic kernels.
+class MultitaskTrainer(FoldTrainer[TorchConfig, ProteinMutationMultitaskNN]):
+    """Fold-local trainer for the shared-backbone network.
 
-    Called once per fold rather than once per run, so that a fold's result does
-    not depend on how many folds ran before it. Determinism also requires
-    single-process data loading, which :func:`make_loader` enforces.
-    """
-    random.seed(seed)
-    # Legacy global seed on purpose: every splitter here is given an explicit
-    # random_state, but a third-party call that reaches for the global NumPy
-    # RNG would otherwise be the one unseeded thing in the run.
-    np.random.seed(seed)  # noqa: NPY002
-    torch.manual_seed(seed)
-    torch.cuda.manual_seed_all(seed)
-    torch.use_deterministic_algorithms(True, warn_only=True)
-    torch.backends.cudnn.benchmark = False
-
-
-def make_loader(x: Tensor, y_stability: Tensor, y_function: Tensor, config: TorchConfig, *,
-                shuffle: bool) -> DataLoader[tuple[Tensor, ...]]:
-    """Wrap tensors in a seeded, single-process ``DataLoader``.
-
-    ``num_workers=0`` and an explicit generator keep batch order reproducible;
-    multi-process loading would reintroduce nondeterminism for no gain at this
-    data size (840 rows).
-    """
-    generator = torch.Generator()
-    generator.manual_seed(config.seed)
-    return DataLoader(
-        TensorDataset(x, y_stability, y_function),
-        batch_size=config.batch_size,
-        shuffle=shuffle,
-        generator=generator if shuffle else None,
-        num_workers=0,
-        drop_last=False,
-    )
-
-
-# =============================================================================
-# Inner split for early stopping
-# =============================================================================
-class InnerSplitSettings(Protocol):
-    """The two settings :func:`inner_split` needs from a training config.
-
-    Declared structurally so that both network architectures can share the
-    splitter without either one's config class depending on the other's. The
-    members are read-only properties because both config classes are frozen
-    dataclasses, whose attributes a settable protocol member would reject.
+    All the machinery — seeding, the inner split, the target scaler, the epoch
+    loop and early stopping — is inherited from :class:`FoldTrainer`. The two
+    things specific to this architecture are supplied here: it consumes a
+    single concatenated input block, built by the same
+    :func:`src.model.build_preprocessor` the sklearn baselines use, and it
+    constructs a :class:`~src.torch_model.ProteinMutationMultitaskNN`.
     """
 
-    @property
-    def inner_val_fraction(self) -> float:
-        """Share of the training fold held out for early stopping."""
+    model_name = const.TORCH_MODEL_NAME
 
-    @property
-    def seed(self) -> int:
-        """Project random seed."""
+    def fit_fold_inputs(
+        self, df: pd.DataFrame, inner_train_idx: np.ndarray, inner_val_idx: np.ndarray
+    ) -> FoldInputs:
+        """Fit one ColumnTransformer on the inner-training rows.
 
-
-def inner_split(
-    df: pd.DataFrame,
-    train_idx: np.ndarray,
-    strategy: const.SplitStrategy,
-    config: InnerSplitSettings,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Split the training fold into inner-train and inner-validation rows.
-
-    The split is grouped by the same column as the outer strategy whenever the
-    training fold holds more than one group, so the stopping epoch is chosen
-    under the same generalisation regime the outer metric reports. It degrades
-    to a plain random split only when grouping is impossible (a single group,
-    or a random outer strategy).
-
-    Args:
-        df: Full labelled table.
-        train_idx: Positional indices of the outer training fold.
-        strategy: Outer splitting strategy.
-        config: Resolved torch settings.
-
-    Returns:
-        ``(inner_train_idx, inner_val_idx)`` as positional indices into ``df``.
-
-    Raises:
-        ValueError: If the fraction leaves either side empty.
-    """
-    groups = group_labels(df, strategy)
-    fold_groups = None if groups is None else groups.to_numpy()[train_idx]
-    splitter: GroupShuffleSplit | ShuffleSplit
-    if fold_groups is not None and pd.unique(fold_groups).size > 1:
-        splitter = GroupShuffleSplit(
-            n_splits=1, test_size=config.inner_val_fraction, random_state=config.seed
-        )
-    else:
-        if fold_groups is not None:
-            logger.debug("Training fold has a single %s group; inner split falls back to random",
-                         strategy.value)
-        fold_groups = None
-        splitter = ShuffleSplit(n_splits=1, test_size=config.inner_val_fraction,
-                                random_state=config.seed)
-
-    local_train, local_val = next(splitter.split(train_idx, groups=fold_groups))
-    if local_train.size == 0 or local_val.size == 0:
-        raise ValueError(
-            f"torch.early_stopping.inner_val_fraction={config.inner_val_fraction} leaves an empty "
-            f"side for a training fold of {train_idx.size} rows"
-        )
-    return train_idx[local_train], train_idx[local_val]
-
-
-# =============================================================================
-# Target scaling
-# =============================================================================
-class TargetScaler:
-    """Standardises the stability target, fitted on inner-training rows only.
-
-    ``functional_score`` is left untouched: it already lives on 0-1 and is
-    produced by a sigmoid head, so scaling it would break that correspondence.
-    Stability is a free-energy change whose scale is arbitrary relative to the
-    function target, and leaving it unscaled lets it dominate the shared
-    backbone's gradients.
-    """
-
-    def __init__(self, *, enabled: bool) -> None:
-        self.enabled = enabled
-        self.mean = 0.0
-        self.std = 1.0
-
-    def fit(self, values: np.ndarray) -> TargetScaler:
-        """Learn the mean and standard deviation (no-op when disabled)."""
-        if self.enabled:
-            self.mean = float(values.mean())
-            std = float(values.std(ddof=0))
-            # A constant target would otherwise divide by zero; keep it as-is.
-            self.std = std if std > 0 else 1.0
-        return self
-
-    def transform(self, values: np.ndarray) -> np.ndarray:
-        """Apply the learned standardisation."""
-        return (values - self.mean) / self.std if self.enabled else values
-
-    def inverse_transform(self, values: np.ndarray) -> np.ndarray:
-        """Map predictions back to kcal/mol."""
-        return values * self.std + self.mean if self.enabled else values
-
-
-# =============================================================================
-# Training one fold
-# =============================================================================
-def to_tensor(values: np.ndarray, device: str) -> Tensor:
-    """Float32 tensor on the target device."""
-    return torch.as_tensor(np.asarray(values, dtype=np.float32), device=device)
-
-
-def _evaluate_loss(
-    model: ProteinMutationMultitaskNN, loader: DataLoader[tuple[Tensor, ...]], config: TorchConfig
-) -> float:
-    """Mean weighted multitask loss over a loader, with the model in eval mode."""
-    model.eval()
-    total, n_rows = 0.0, 0
-    with torch.no_grad():
-        for features, y_stability, y_function in loader:
-            loss, _, _ = multitask_loss(model(features), (y_stability, y_function), config.loss_weights)
-            total += float(loss) * features.shape[0]
-            n_rows += features.shape[0]
-    return total / max(n_rows, 1)
-
-
-def train_one_fold(
-    df: pd.DataFrame,
-    fold: Fold,
-    features: FeatureSet,
-    cfg: dict[str, Any],
-    config: TorchConfig,
-) -> tuple[ProteinMutationMultitaskNN, ColumnTransformer, TargetScaler, pd.DataFrame, dict[str, Any]]:
-    """Fit the network on one fold, early-stopping on an inner split.
-
-    Everything learned here — imputer, scaler, PCA, target mean/std and the
-    weights themselves — is fitted on training-fold rows only.
-
-    Returns:
-        ``(model, preprocessor, target_scaler, history, summary)`` where
-        ``history`` has one row per epoch and ``summary`` records the stopping
-        behaviour for the provenance table.
-    """
-    seed_everything(config.seed)
-    inner_train_idx, inner_val_idx = inner_split(df, fold.train_idx, fold.strategy, config)
-
-    # Preprocessing is fitted on the inner-training rows: the inner-validation
-    # rows drive early stopping, so they must stay outside every fitted object.
-    preprocessor = build_preprocessor(cfg, features)
-    x_all = df[features.all]
-    x_inner_train = preprocessor.fit_transform(x_all.iloc[inner_train_idx])
-    x_inner_val = preprocessor.transform(x_all.iloc[inner_val_idx])
-
-    scaler = TargetScaler(enabled=config.standardize_stability_target)
-    scaler.fit(df[TARGET_STABILITY].to_numpy(dtype=float)[inner_train_idx])
-
-    def targets(idx: np.ndarray) -> tuple[Tensor, Tensor]:
-        stability = scaler.transform(df[TARGET_STABILITY].to_numpy(dtype=float)[idx])
-        function = df[TARGET_FUNCTION].to_numpy(dtype=float)[idx]
-        return to_tensor(stability, config.device), to_tensor(function, config.device)
-
-    train_loader = make_loader(
-        to_tensor(x_inner_train, config.device), *targets(inner_train_idx), config, shuffle=True
-    )
-    val_loader = make_loader(
-        to_tensor(x_inner_val, config.device), *targets(inner_val_idx), config, shuffle=False
-    )
-
-    model = ProteinMutationMultitaskNN(x_inner_train.shape[1], config).to(config.device)
-    optimizer = torch.optim.Adam(
-        model.parameters(), lr=config.learning_rate, weight_decay=config.weight_decay
-    )
-
-    best_loss, best_epoch, best_state = float("inf"), 0, {
-        k: v.detach().clone() for k, v in model.state_dict().items()
-    }
-    records, epochs_without_gain = [], 0
-    for epoch in range(1, config.max_epochs + 1):
-        model.train()
-        running, n_rows = 0.0, 0
-        for batch_x, batch_stability, batch_function in train_loader:
-            optimizer.zero_grad(set_to_none=True)
-            loss, _, _ = multitask_loss(
-                model(batch_x), (batch_stability, batch_function), config.loss_weights
-            )
-            loss.backward()
-            optimizer.step()
-            # Detached before the cast: the running total is a log value, and
-            # keeping it attached to the graph would retain the whole epoch.
-            running += loss.detach().item() * batch_x.shape[0]
-            n_rows += batch_x.shape[0]
-        train_loss = running / max(n_rows, 1)
-        val_loss = _evaluate_loss(model, val_loader, config)
-        records.append(
-            {
-                const.CV_COL_STRATEGY: fold.strategy.value,
-                const.CV_COL_FOLD: fold.index,
-                const.TORCH_COL_EPOCH: epoch,
-                const.TORCH_COL_TRAIN_LOSS: train_loss,
-                const.TORCH_COL_VAL_LOSS: val_loss,
-            }
+        A single block: the tabular columns and the PCA-reduced embedding are
+        concatenated before the network sees them, which is exactly what the
+        dual-branch architecture was written to avoid.
+        """
+        preprocessor = build_preprocessor(self.cfg, self.features)
+        x_all = df[self.features.all]
+        train = preprocessor.fit_transform(x_all.iloc[inner_train_idx])
+        val = preprocessor.transform(x_all.iloc[inner_val_idx])
+        return FoldInputs(
+            train=(train,),
+            val=(val,),
+            transform=lambda frame: (preprocessor.transform(frame[self.features.all]),),
+            fitted=(preprocessor,),
         )
 
-        if val_loss < best_loss - config.min_delta:
-            best_loss, best_epoch, epochs_without_gain = val_loss, epoch, 0
-            best_state = {k: v.detach().clone() for k, v in model.state_dict().items()}
-        else:
-            epochs_without_gain += 1
-            if epochs_without_gain >= config.patience:
-                break
-
-    # Always report the best epoch's network, not the last one's.
-    model.load_state_dict(best_state)
-    summary = {
-        const.CV_COL_STRATEGY: fold.strategy.value,
-        const.CV_COL_FOLD: fold.index,
-        const.TORCH_COL_BEST_EPOCH: best_epoch,
-        const.TORCH_COL_STOPPED_EPOCH: records[-1][const.TORCH_COL_EPOCH],
-        const.TORCH_COL_VAL_LOSS: best_loss,
-        const.TORCH_COL_N_INNER_TRAIN: int(inner_train_idx.size),
-        const.TORCH_COL_N_INNER_VAL: int(inner_val_idx.size),
-    }
-    logger.info(
-        "[%s] fold %d: best epoch %d/%d (val loss %.5f), inner split %d/%d",
-        fold.strategy.value,
-        fold.index,
-        best_epoch,
-        summary[const.TORCH_COL_STOPPED_EPOCH],
-        best_loss,
-        inner_train_idx.size,
-        inner_val_idx.size,
-    )
-    return model, preprocessor, scaler, pd.DataFrame(records), summary
-
-
-def predict_rows(
-    model: ProteinMutationMultitaskNN,
-    preprocessor: ColumnTransformer,
-    scaler: TargetScaler,
-    frame: pd.DataFrame,
-    features: FeatureSet,
-    config: TorchConfig,
-) -> tuple[np.ndarray, np.ndarray]:
-    """Predict both targets for ``frame``, returning stability in kcal/mol."""
-    model.eval()
-    x = to_tensor(preprocessor.transform(frame[features.all]), config.device)
-    with torch.no_grad():
-        stability, function = model(x)
-    return (
-        scaler.inverse_transform(stability.cpu().numpy().astype(float)),
-        function.cpu().numpy().astype(float),
-    )
-
-
-# =============================================================================
-# Cross-validation
-# =============================================================================
-def cross_validate_torch(
-    df: pd.DataFrame, folds: list[Fold], features: FeatureSet, cfg: dict[str, Any], config: TorchConfig
-) -> tuple[pd.DataFrame, pd.DataFrame, pd.DataFrame, dict[int, tuple[Any, Any, Any]]]:
-    """Train and score the network on every fold.
-
-    Returns:
-        ``(oof, history, fold_summary, artifacts)``. ``oof`` uses the same long
-        schema as the sklearn baselines, so the two can be concatenated.
-        ``artifacts`` maps fold index to ``(model, preprocessor, scaler)``.
-    """
-    oof_frames, histories, summaries = [], [], []
-    artifacts: dict[int, tuple[Any, Any, Any]] = {}
-    for fold in folds:
-        model, preprocessor, scaler, history, summary = train_one_fold(df, fold, features, cfg, config)
-        val_rows = df.iloc[fold.val_idx]
-        stability, function = predict_rows(model, preprocessor, scaler, val_rows, features, config)
-
-        for target, predicted in ((TARGET_STABILITY, stability), (TARGET_FUNCTION, function)):
-            oof_frames.append(
-                pd.DataFrame(
-                    {
-                        const.COL_MUTATION_ID: val_rows[const.COL_MUTATION_ID].to_numpy(),
-                        const.COL_PROTEIN_ID: val_rows[const.COL_PROTEIN_ID].to_numpy(),
-                        const.COL_PROTEIN_FAMILY: val_rows[const.COL_PROTEIN_FAMILY].to_numpy(),
-                        const.CV_COL_STRATEGY: fold.strategy.value,
-                        const.COL_MODEL: const.TORCH_MODEL_NAME,
-                        const.COL_TARGET: target,
-                        const.CV_COL_FOLD: fold.index,
-                        const.COL_Y_TRUE: val_rows[target].to_numpy(dtype=float),
-                        const.COL_Y_PRED: predicted,
-                    }
-                )
-            )
-        histories.append(history)
-        summaries.append(summary)
-        artifacts[fold.index] = (model, preprocessor, scaler)
-    return (
-        pd.concat(oof_frames, ignore_index=True),
-        pd.concat(histories, ignore_index=True),
-        pd.DataFrame(summaries),
-        artifacts,
-    )
-
-
-def summarize_torch_metrics(oof: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
-    """Pooled out-of-fold metrics per target, plus the per-fold spread."""
-    metrics = configured_metrics(cfg)
-    rows = []
-    for (strategy, target), group in oof.groupby(
-        [const.CV_COL_STRATEGY, const.COL_TARGET], sort=False
-    ):
-        pooled = compute_metrics(
-            group[const.COL_Y_TRUE].to_numpy(), group[const.COL_Y_PRED].to_numpy(), metrics
-        )
-        per_fold = [
-            compute_metrics(f[const.COL_Y_TRUE].to_numpy(), f[const.COL_Y_PRED].to_numpy(), metrics)
-            for _, f in group.groupby(const.CV_COL_FOLD, sort=True)
-        ]
-        fold_table = pd.DataFrame(per_fold)
-        rows.append(
-            {
-                const.CV_COL_STRATEGY: strategy,
-                const.COL_MODEL: const.TORCH_MODEL_NAME,
-                const.COL_TARGET: target,
-                const.COL_N_SAMPLES: len(group),
-                **{f"{const.POOLED_PREFIX}{k}": v for k, v in pooled.items()},
-                **{
-                    f"{const.FOLD_MEAN_PREFIX}{m.value}": float(fold_table[m.value].mean())
-                    for m in metrics
-                },
-                **{
-                    f"{const.FOLD_STD_PREFIX}{m.value}": float(fold_table[m.value].std())
-                    for m in metrics
-                },
-            }
-        )
-        logger.info(
-            "[%s|%s|%s] pooled OOF: %s",
-            strategy,
-            const.TORCH_MODEL_NAME,
-            target,
-            ", ".join(f"{k}={v:.3f}" for k, v in pooled.items()),
-        )
-    return pd.DataFrame(rows)
+    def build_model(self, widths: tuple[int, ...]) -> ProteinMutationMultitaskNN:
+        """Construct the shared-backbone network for the single input block."""
+        return ProteinMutationMultitaskNN(widths[0], self.config)
 
 
 def compare_with_baselines(
@@ -582,7 +230,7 @@ def save_artifacts(
     history: pd.DataFrame,
     fold_summary: pd.DataFrame,
     comparison: pd.DataFrame,
-    artifacts: dict[int, tuple[Any, Any, Any]],
+    artifacts: dict[int, FoldResult[ProteinMutationMultitaskNN]],
     features: FeatureSet,
     cfg: dict[str, Any],
     config: TorchConfig,
@@ -621,7 +269,8 @@ def save_artifacts(
         models_dir = resolve_path(cfg, "models_dir") / const.TORCH_MODELS_SUBDIR
         models_dir.mkdir(parents=True, exist_ok=True)
         strategy = oof[const.CV_COL_STRATEGY].iloc[0]
-        for fold_index, (model, preprocessor, scaler) in sorted(artifacts.items()):
+        for fold_index, result in sorted(artifacts.items()):
+            model, preprocessor, scaler = result.model, result.inputs.fitted[0], result.scaler
             weights = const.TORCH_FOLD_MODEL_TEMPLATE.format(strategy=strategy, fold=fold_index)
             torch.save(
                 {
@@ -642,7 +291,7 @@ def save_artifacts(
             saved_folds.append(f"{const.TORCH_MODELS_SUBDIR}/{weights}")
         paths["torch_fold_models"] = models_dir
 
-    example = next(iter(artifacts.values()))[0] if artifacts else None  # noqa: SIM108
+    example = next(iter(artifacts.values())).model if artifacts else None  # noqa: SIM108
     metadata = {
         "model": const.TORCH_MODEL_NAME,
         "random_seed": config.seed,
@@ -719,8 +368,9 @@ def run_torch_training(cfg: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]
         *config.loss_weights,
     )
 
-    oof, history, fold_summary, artifacts = cross_validate_torch(df, folds, features, cfg, config)
-    summary = summarize_torch_metrics(oof, cfg)
+    trainer = MultitaskTrainer(cfg, config, features)
+    oof, history, fold_summary, artifacts = trainer.cross_validate(df, folds)
+    summary = trainer.summarize(oof)
     comparison = compare_with_baselines(summary, cfg)
     save_artifacts(
         oof, summary, history, fold_summary, comparison, artifacts, features, cfg, config

@@ -42,6 +42,18 @@ from sklearn.metrics import mean_absolute_error, mean_squared_error, r2_score
 from src.common import constants as const
 from src.common.config import DEFAULT_CONFIG_PATH, load_config, resolve_path, setup_logging
 from src.common.io import read_table, write_table
+from src.figures import (
+    AblationPerformanceDrop,
+    BaselineVsNetwork,
+    FeatureImportance,
+    FigureSet,
+    GroupImportance,
+    LearningCurves,
+    ModelComparison,
+    PredictedVsActual,
+    ResidualDistribution,
+    StrategyComparison,
+)
 from src.model import CVResults, FloatArray
 
 logger = logging.getLogger(__name__)
@@ -622,514 +634,33 @@ def evaluation_record(
 # =============================================================================
 # Figures
 # =============================================================================
-def _figure_paths(cfg: dict[str, Any], keys: tuple[str, ...] = const.FIGURE_FILE_KEYS) -> dict[str, Path]:
-    """Resolve the configured figure filenames under ``paths.figures_dir``."""
-    return {key: resolve_path(cfg, "figures_dir", key) for key in keys}
-
-
-def _pyplot() -> Any:
-    """Import pyplot against the non-interactive backend.
-
-    Deferred to call time, and to each plotting function, so that importing
-    this module costs nothing on a headless machine or when figures are off.
-    """
-    import matplotlib
-
-    matplotlib.use(const.MATPLOTLIB_BACKEND)
-    import matplotlib.pyplot as plt
-
-    return plt
-
-
-def _save(fig: Any, path: Path, dpi: int) -> Path:
-    """Write ``fig`` to ``path``, creating the directory, and close it."""
-    fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=dpi)
-    _pyplot().close(fig)
-    return path
-
-
-def plot_predicted_vs_actual(oof: pd.DataFrame, path: Path, dpi: int) -> Path:
-    """Scatter OOF prediction against ground truth, one panel per target."""
-    plt = _pyplot()
-
-    targets = list(const.TARGETS.values())
-    fig, axes = plt.subplots(1, len(targets), figsize=(5.5 * len(targets), 5.0))
-    for ax, target in zip(np.atleast_1d(axes), targets, strict=True):
-        group = oof[oof[const.COL_TARGET] == target]
-        y_true = group[const.COL_Y_TRUE].to_numpy(dtype=float)
-        y_pred = group[const.COL_Y_PRED].to_numpy(dtype=float)
-        ax.scatter(y_true, y_pred, s=14, alpha=0.55, edgecolor="none")
-        if y_true.size:
-            limits = [min(y_true.min(), y_pred.min()), max(y_true.max(), y_pred.max())]
-            ax.plot(limits, limits, linestyle="--", linewidth=1.0, color="grey")
-        ax.set_xlabel(f"observed {target}")
-        ax.set_ylabel(f"out-of-fold predicted {target}")
-        ax.set_title(target)
-    fig.suptitle("Out-of-fold predictions vs ground truth")
-    return _save(fig, path, dpi)
-
-
-def plot_residual_distribution(oof: pd.DataFrame, path: Path, dpi: int) -> Path:
-    """Histogram the OOF residuals per target to expose bias and heavy tails."""
-    plt = _pyplot()
-
-    targets = list(const.TARGETS.values())
-    fig, axes = plt.subplots(1, len(targets), figsize=(5.5 * len(targets), 4.0))
-    for ax, target in zip(np.atleast_1d(axes), targets, strict=True):
-        group = oof[oof[const.COL_TARGET] == target]
-        residual = group[const.COL_Y_PRED].to_numpy(dtype=float) - group[const.COL_Y_TRUE].to_numpy(
-            dtype=float
-        )
-        ax.hist(residual, bins=const.RESIDUAL_HIST_BINS)
-        ax.axvline(0.0, linestyle="--", linewidth=1.0, color="grey")
-        ax.set_xlabel(f"predicted - observed ({target})")
-        ax.set_ylabel("mutations")
-        ax.set_title(f"{target}: mean {residual.mean():+.3f}" if residual.size else target)
-    fig.suptitle("Out-of-fold residual distribution")
-    return _save(fig, path, dpi)
-
-
-def plot_strategy_comparison(summary: pd.DataFrame, cfg: dict[str, Any], path: Path, dpi: int) -> Path:
-    """Bar-chart the pooled selection metric per model under every CV strategy.
-
-    This is the visual form of the optimism gap: bars that shrink from left to
-    right as the split gets stricter are the signature of leakage-driven
-    optimism in the random split.
-    """
-    plt = _pyplot()
-
-    metric = f"{const.POOLED_PREFIX}{cfg['models']['selection_metric']}"
-    strategies = [s for s in cfg["validation"]["strategies"] if s in set(summary[const.CV_COL_STRATEGY])]
-    targets = list(const.TARGETS.values())
-    fig, axes = plt.subplots(1, len(targets), figsize=(6.0 * len(targets), 4.5), sharey=True)
-    for ax, target in zip(np.atleast_1d(axes), targets, strict=True):
-        rows = summary[summary[const.COL_TARGET] == target]
-        models = list(dict.fromkeys(rows[const.COL_MODEL]))
-        width = 0.8 / max(len(strategies), 1)
-        positions = np.arange(len(models), dtype=float)
-        for offset, strategy in enumerate(strategies):
-            values = [
-                rows[(rows[const.COL_MODEL] == model) & (rows[const.CV_COL_STRATEGY] == strategy)][
-                    metric
-                ].to_numpy(dtype=float)
-                for model in models
-            ]
-            heights = [float(v[0]) if v.size else float("nan") for v in values]
-            ax.bar(positions + offset * width, heights, width=width, label=strategy)
-        ax.set_xticks(positions + width * (len(strategies) - 1) / 2)
-        ax.set_xticklabels(models, rotation=const.FIGURE_XTICK_ROTATION, ha="right")
-        ax.set_ylabel(metric)
-        ax.set_title(target)
-        ax.axhline(0.0, linewidth=0.8, color="black")
-    np.atleast_1d(axes)[0].legend(title="CV strategy")
-    fig.suptitle(f"{metric} by model and cross-validation strategy")
-    return _save(fig, path, dpi)
-
-
+# The figures themselves live in `src/figures.py`: each is a Figure subclass
+# that knows its own config key and how to draw itself. What stays here is the
+# assembly — which figures a stage emits, and what data each one is handed.
 def make_figures(oof: pd.DataFrame, summary: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Path]:
-    """Write every evaluation figure; returns the written paths (empty if disabled)."""
-    if not cfg["evaluation"]["figures"]:
-        logger.info("evaluation.figures is false: skipping figure generation")
-        return {}
-    dpi = cfg["evaluation"]["figure_dpi"]
-    paths = _figure_paths(cfg)
-    written = {
-        "fig_pred_vs_actual": plot_predicted_vs_actual(oof, paths["fig_pred_vs_actual"], dpi),
-        "fig_residuals": plot_residual_distribution(oof, paths["fig_residuals"], dpi),
-        "fig_strategy_comparison": plot_strategy_comparison(
-            summary, cfg, paths["fig_strategy_comparison"], dpi
-        ),
-    }
-    for key, path in written.items():
-        logger.info("Wrote %s -> %s", key, path)
-    return written
-
-
-# =============================================================================
-# Figures for the neural network and the model comparison (assignment Task 4)
-# =============================================================================
-def plot_learning_curves(
-    history: pd.DataFrame, fold_summary: pd.DataFrame, path: Path, dpi: int
-) -> Path:
-    """Plot training and inner-validation loss per epoch, one panel per fold.
-
-    This is the figure that shows early stopping actually working: the dashed
-    line marks the epoch whose weights were kept, and it should sit at the
-    minimum of the inner-validation curve, well before the run ends. A fold
-    whose best epoch is its last one never converged and was cut off by
-    ``torch.max_epochs`` instead of by the stopping rule.
-
-    The validation curve here is the **inner** split carved from the training
-    fold, not the out-of-fold rows the metrics are computed on, so it says
-    nothing about reported performance — only about when to stop.
-    """
-    plt = _pyplot()
-
-    folds = sorted(history[const.CV_COL_FOLD].unique())
-    columns = min(const.LEARNING_CURVE_COLUMNS, max(len(folds), 1))
-    rows = -(-len(folds) // columns)  # ceiling division
-    fig, axes = plt.subplots(
-        rows, columns, figsize=(4.6 * columns, 3.4 * rows), squeeze=False, sharex=False
-    )
-    flat = axes.ravel()
-    best_epochs = (
-        fold_summary.set_index(const.CV_COL_FOLD)[const.TORCH_COL_BEST_EPOCH]
-        if const.TORCH_COL_BEST_EPOCH in fold_summary
-        else pd.Series(dtype=float)
-    )
-    for ax, fold in zip(flat, folds, strict=False):
-        curve = history[history[const.CV_COL_FOLD] == fold].sort_values(const.TORCH_COL_EPOCH)
-        epochs = curve[const.TORCH_COL_EPOCH].to_numpy(dtype=float)
-        ax.plot(epochs, curve[const.TORCH_COL_TRAIN_LOSS].to_numpy(dtype=float), label="train")
-        ax.plot(
-            epochs,
-            curve[const.TORCH_COL_VAL_LOSS].to_numpy(dtype=float),
-            label="inner validation",
-        )
-        if fold in best_epochs.index:
-            best = float(best_epochs.loc[fold])
-            ax.axvline(best, linestyle="--", linewidth=1.0, color="grey")
-            ax.set_title(f"fold {fold} (kept epoch {best:.0f})")
-        else:
-            ax.set_title(f"fold {fold}")
-        ax.set_xlabel("epoch")
-        ax.set_ylabel("weighted multitask loss")
-    for ax in flat[len(folds) :]:
-        ax.set_visible(False)
-    flat[0].legend()
-    fig.suptitle("Neural network learning curves (loss per fold)")
-    return _save(fig, path, dpi)
-
-
-def plot_model_comparison(comparison: pd.DataFrame, cfg: dict[str, Any], path: Path, dpi: int) -> Path:
-    """Bar-chart every configured metric for every model, baselines and network alike.
-
-    One panel per target × metric, because the metrics are on incompatible
-    scales — RMSE and MAE are in target units, R² and the two correlations are
-    dimensionless — and putting them on shared axes would misrepresent them.
-    Each panel's title states the direction, since lower is better for the
-    error metrics and higher for the rest.
-    """
-    plt = _pyplot()
-
-    metrics = configured_metrics(cfg)
-    targets = [t for t in const.TARGETS.values() if t in set(comparison[const.COL_TARGET])]
-    models = list(dict.fromkeys(comparison[const.COL_MODEL]))
-    fig, axes = plt.subplots(
-        len(targets),
-        len(metrics),
-        figsize=(3.1 * len(metrics), 3.4 * len(targets)),
-        squeeze=False,
-    )
-    for row, target in enumerate(targets):
-        rows = comparison[comparison[const.COL_TARGET] == target].set_index(const.COL_MODEL)
-        for column, metric in enumerate(metrics):
-            ax = axes[row][column]
-            name = f"{const.POOLED_PREFIX}{metric.value}"
-            heights = [
-                float(rows.loc[model, name]) if model in rows.index else float("nan")
-                for model in models
-            ]
-            # The network is the subject of the comparison, so it is the one bar
-            # that is filled differently; everything else is a reference point.
-            colors = ["tab:orange" if m == const.TORCH_MODEL_NAME else "tab:blue" for m in models]
-            ax.bar(np.arange(len(models)), heights, color=colors)
-            ax.set_xticks(np.arange(len(models)))
-            ax.set_xticklabels(models, rotation=const.FIGURE_XTICK_ROTATION, ha="right")
-            direction = "higher is better" if const.METRIC_GREATER_IS_BETTER[metric] else "lower is better"
-            ax.set_title(f"{metric.value} ({direction})", fontsize=9)
-            ax.axhline(0.0, linewidth=0.8, color="black")
-            if column == 0:
-                ax.set_ylabel(target)
-    strategy = comparison[const.CV_COL_STRATEGY].iloc[0] if not comparison.empty else "n/a"
-    fig.suptitle(f"Pooled out-of-fold metrics by model ({strategy} cross-validation)")
-    return _save(fig, path, dpi)
-
-
-def plot_baseline_vs_torch(
-    baseline_oof: pd.DataFrame,
-    torch_oof: pd.DataFrame,
-    path: Path,
-    dpi: int,
-    model_label: str = const.TORCH_MODEL_NAME,
-) -> Path:
-    """Overlay the selected baseline and the network on the same out-of-fold rows.
-
-    Top row is predicted against observed with the identity line; bottom row is
-    the residual distribution. Two models trained on identical folds predict the
-    same rows, so these panels are directly comparable: a model that tracks the
-    identity line but spreads wider is worse at the same job, whereas one whose
-    residual histogram is shifted off zero is biased rather than merely noisy.
-    """
-    plt = _pyplot()
-
-    targets = list(const.TARGETS.values())
-    fig, axes = plt.subplots(2, len(targets), figsize=(5.4 * len(targets), 8.0), squeeze=False)
-    series = [("best baseline", baseline_oof), (model_label, torch_oof)]
-    for column, target in enumerate(targets):
-        scatter_ax, hist_ax = axes[0][column], axes[1][column]
-        bounds: list[float] = []
-        for label, frame in series:
-            group = frame[frame[const.COL_TARGET] == target]
-            if group.empty:
-                continue
-            y_true = group[const.COL_Y_TRUE].to_numpy(dtype=float)
-            y_pred = group[const.COL_Y_PRED].to_numpy(dtype=float)
-            name = (
-                f"{label} ({group[const.COL_MODEL].iloc[0]})"
-                if label == "best baseline"
-                else label
-            )
-            scatter_ax.scatter(
-                y_true, y_pred, s=14, alpha=const.FIGURE_SCATTER_ALPHA, edgecolor="none", label=name
-            )
-            hist_ax.hist(
-                y_pred - y_true,
-                bins=const.RESIDUAL_HIST_BINS,
-                alpha=const.FIGURE_OVERLAY_ALPHA,
-                label=f"{name}: mean {float((y_pred - y_true).mean()):+.3f}",
-            )
-            bounds += [float(y_true.min()), float(y_true.max()), float(y_pred.min()), float(y_pred.max())]
-        if bounds:
-            limits = [min(bounds), max(bounds)]
-            scatter_ax.plot(limits, limits, linestyle="--", linewidth=1.0, color="grey")
-        scatter_ax.set_xlabel(f"observed {target}")
-        scatter_ax.set_ylabel(f"out-of-fold predicted {target}")
-        scatter_ax.set_title(target)
-        scatter_ax.legend(fontsize=8)
-        hist_ax.axvline(0.0, linestyle="--", linewidth=1.0, color="grey")
-        hist_ax.set_xlabel(f"predicted - observed ({target})")
-        hist_ax.set_ylabel("mutations")
-        hist_ax.legend(fontsize=8)
-    fig.suptitle("Selected baseline vs. multitask network on identical out-of-fold rows")
-    return _save(fig, path, dpi)
-
-
-def plot_ablation_performance_drop(
-    table: pd.DataFrame, cfg: dict[str, Any], path: Path, dpi: int
-) -> Path:
-    """Chart each feature subset's metric change against the baseline subset.
-
-    One row per headline metric, one column per target. Bars are the signed
-    difference from the baseline subset, so the zero line *is* the full feature
-    set and a bar's length is exactly what removing (or keeping only) that
-    group costs. Colour encodes the direction after accounting for each
-    metric's polarity, which matters because the same sign means opposite
-    things for an error metric and a correlation.
-
-    Horizontal bars, because subset names are long and reading seven rotated
-    labels is worse than reading seven horizontal ones.
-    """
-    plt = _pyplot()
-
-    baseline_name = cfg["ablation"]["baseline"]
-    metrics = [m for m in const.ABL_HEADLINE_METRICS if m in set(configured_metrics(cfg))]
-    targets = [t for t in const.TARGETS.values() if t in set(table[const.COL_TARGET])]
-    # Config order, baseline last, so the arms read in the order they are declared.
-    subsets = [s for s in dict.fromkeys(table[const.ABL_COL_SUBSET]) if s != baseline_name]
-
-    fig, axes = plt.subplots(
-        len(metrics),
-        len(targets),
-        figsize=(6.0 * len(targets), 0.55 * len(subsets) * len(metrics) + 2.2),
-        squeeze=False,
-    )
-    positions = np.arange(len(subsets), dtype=float)
-    for row, metric in enumerate(metrics):
-        column_name = f"{const.ABL_DELTA_PREFIX}{metric.value}"
-        higher_is_better = const.METRIC_GREATER_IS_BETTER[metric]
-        for column, target in enumerate(targets):
-            ax = axes[row][column]
-            rows = table[table[const.COL_TARGET] == target].set_index(const.ABL_COL_SUBSET)
-            values = [
-                float(rows.loc[subset, column_name]) if subset in rows.index else float("nan")
-                for subset in subsets
-            ]
-            # A drop is a loss whatever the metric's polarity: for r2/spearman
-            # that is a negative delta, for rmse/mae a positive one.
-            colors = [
-                const.ABL_COLOR_LOSS
-                if (value < 0) == higher_is_better
-                else const.ABL_COLOR_GAIN
-                for value in values
-            ]
-            ax.barh(positions, values, color=colors)
-            ax.set_yticks(positions)
-            ax.set_yticklabels(subsets, fontsize=8)
-            ax.invert_yaxis()
-            ax.axvline(0.0, linewidth=1.0, color="black")
-            ax.set_xlabel(f"Δ {metric.value} vs {baseline_name}")
-            ax.set_title(f"{target}", fontsize=10)
-            span = max((abs(v) for v in values if np.isfinite(v)), default=1.0) or 1.0
-            ax.set_xlim(-span * 1.35, span * 1.35)
-            for y, value in zip(positions, values, strict=True):
-                if not np.isfinite(value):
-                    continue
-                offset = const.ABL_BAR_LABEL_PAD * span / abs(span)
-                ax.text(
-                    value + (offset if value >= 0 else -offset),
-                    y,
-                    f"{value:+.3f}",
-                    va="center",
-                    ha="left" if value >= 0 else "right",
-                    fontsize=8,
-                )
-    fig.suptitle(
-        f"Feature-group attribution: change from the full set (`{baseline_name}`) "
-        f"under {table[const.CV_COL_STRATEGY].iloc[0]} cross-validation"
-    )
-    return _save(fig, path, dpi)
-
-
-def plot_feature_importance(
-    per_feature: pd.DataFrame, cfg: dict[str, Any], path: Path, dpi: int
-) -> Path:
-    """Chart the top features per target, coloured by feature group.
-
-    Only the permutation kind is drawn when it is available: impurity
-    importances live on post-PCA inputs and on a different scale, so putting
-    the two on one axis would invite a comparison that is not meaningful.
-
-    Error bars are the between-fold standard deviation. A bar whose whisker
-    crosses zero is not a stable attribution on this dataset, and showing that
-    is the point of drawing them.
-    """
-    plt = _pyplot()
-
-    top_k = int(cfg["attribution"]["top_k"])
-    kinds = list(dict.fromkeys(per_feature[const.ATTR_COL_KIND]))
-    kind = const.ImportanceKind.PERMUTATION.value
-    kind = kind if kind in kinds else kinds[0]
-    rows_for_kind = per_feature[per_feature[const.ATTR_COL_KIND] == kind]
-    targets = [t for t in const.TARGETS.values() if t in set(rows_for_kind[const.COL_TARGET])]
-
-    fig, axes = plt.subplots(
-        1, len(targets), figsize=(7.0 * len(targets), 0.32 * top_k + 2.0), squeeze=False
-    )
-    for column, target in enumerate(targets):
-        ax = axes[0][column]
-        rows = rows_for_kind[rows_for_kind[const.COL_TARGET] == target].head(top_k)
-        positions = np.arange(len(rows), dtype=float)
-        colors = [
-            const.ATTR_GROUP_COLORS.get(group, const.ABL_COLOR_LOSS)
-            for group in rows[const.ATTR_COL_GROUP]
-        ]
-        ax.barh(
-            positions,
-            rows[const.ATTR_COL_MEAN].to_numpy(dtype=float),
-            xerr=rows[const.ATTR_COL_STD].to_numpy(dtype=float),
-            color=colors,
-            error_kw={"elinewidth": 0.8, "ecolor": "#444444"},
-        )
-        ax.set_yticks(positions)
-        ax.set_yticklabels(rows[const.ATTR_COL_FEATURE], fontsize=8)
-        ax.invert_yaxis()
-        ax.axvline(0.0, linewidth=1.0, color="black")
-        ax.set_xlabel(f"{cfg['attribution']['scoring_metric']} lost when shuffled")
-        ax.set_title(target, fontsize=10)
-    handles = [
-        plt.Rectangle((0, 0), 1, 1, color=color)
-        for group, color in const.ATTR_GROUP_COLORS.items()
-        if group in set(rows_for_kind[const.ATTR_COL_GROUP])
-    ]
-    labels = [
-        group
-        for group in const.ATTR_GROUP_COLORS
-        if group in set(rows_for_kind[const.ATTR_COL_GROUP])
-    ]
-    if handles:
-        axes[0][0].legend(handles, labels, title="feature group", fontsize=8, loc="lower right")
-    fig.suptitle(
-        f"Top {top_k} features by {kind} importance, averaged over "
-        f"{cfg['validation']['primary_strategy']} folds"
-    )
-    return _save(fig, path, dpi)
-
-
-def plot_group_importance(
-    per_group: pd.DataFrame, cfg: dict[str, Any], path: Path, dpi: int
-) -> Path:
-    """Chart importance summed within each feature group, per target.
-
-    This is the figure that answers the ablation question directly: how much
-    of the model's realised skill comes from each *source* of information,
-    rather than from any one column.
-    """
-    plt = _pyplot()
-
-    kind = const.ImportanceKind.PERMUTATION.value
-    kinds = list(dict.fromkeys(per_group[const.ATTR_COL_KIND]))
-    kind = kind if kind in kinds else kinds[0]
-    rows_for_kind = per_group[per_group[const.ATTR_COL_KIND] == kind]
-    targets = [t for t in const.TARGETS.values() if t in set(rows_for_kind[const.COL_TARGET])]
-    groups = [g for g in const.ATTR_GROUP_COLORS if g in set(rows_for_kind[const.ATTR_COL_GROUP])]
-
-    fig, axes = plt.subplots(1, len(targets), figsize=(5.5 * len(targets), 4.2), squeeze=False)
-    for column, target in enumerate(targets):
-        ax = axes[0][column]
-        rows = rows_for_kind[rows_for_kind[const.COL_TARGET] == target].set_index(
-            const.ATTR_COL_GROUP
-        )
-        heights = [
-            float(rows.loc[group, const.ATTR_COL_MEAN]) if group in rows.index else 0.0
-            for group in groups
-        ]
-        positions = np.arange(len(groups), dtype=float)
-        ax.bar(positions, heights, color=[const.ATTR_GROUP_COLORS[g] for g in groups])
-        ax.set_xticks(positions)
-        ax.set_xticklabels(groups, rotation=const.FIGURE_XTICK_ROTATION, ha="right", fontsize=8)
-        ax.axhline(0.0, linewidth=1.0, color="black")
-        ax.set_ylabel(f"summed {cfg['attribution']['scoring_metric']} lost when shuffled")
-        ax.set_title(target, fontsize=10)
-        for x, height in zip(positions, heights, strict=True):
-            ax.text(x, height, f"{height:+.3f}", ha="center",
-                    va="bottom" if height >= 0 else "top", fontsize=8)
-    fig.suptitle(f"Where the model's skill comes from, by feature group ({kind} importance)")
-    return _save(fig, path, dpi)
+    """Write the Phase 3 evaluation figures; empty when figures are disabled."""
+    return FigureSet(
+        [
+            PredictedVsActual(oof, cfg),
+            ResidualDistribution(oof, cfg),
+            StrategyComparison(summary, cfg),
+        ],
+        cfg,
+    ).render()
 
 
 def make_attribution_figures(
     per_feature: pd.DataFrame, per_group: pd.DataFrame, cfg: dict[str, Any]
 ) -> dict[str, Path]:
-    """Write the Task 7 figures; returns the written paths (empty if disabled)."""
-    if not cfg["evaluation"]["figures"]:
-        logger.info("evaluation.figures is false: skipping the attribution figures")
-        return {}
-    dpi = cfg["evaluation"]["figure_dpi"]
-    paths = _figure_paths(cfg, const.ATTR_FIGURE_FILE_KEYS)
-    written: dict[str, Path] = {}
-    if not per_feature.empty:
-        written["fig_feature_importance"] = plot_feature_importance(
-            per_feature, cfg, paths["fig_feature_importance"], dpi
-        )
-    if not per_group.empty:
-        written["fig_group_importance"] = plot_group_importance(
-            per_group, cfg, paths["fig_group_importance"], dpi
-        )
-    for key, figure in written.items():
-        logger.info("Wrote %s -> %s", key, figure)
-    return written
+    """Write the Task 7 attribution figures; empty when figures are disabled."""
+    return FigureSet(
+        [FeatureImportance(per_feature, cfg), GroupImportance(per_group, cfg)], cfg
+    ).render()
 
 
 def make_ablation_figures(table: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Path]:
-    """Write the ablation figure; returns the written paths (empty if disabled)."""
-    if not cfg["evaluation"]["figures"]:
-        logger.info("evaluation.figures is false: skipping the ablation figure")
-        return {}
-    if table.empty:
-        logger.warning("Ablation table is empty: no figure to draw")
-        return {}
-    paths = _figure_paths(cfg, const.ABLATION_FIGURE_FILE_KEYS)
-    written = {
-        "fig_ablation_drop": plot_ablation_performance_drop(
-            table, cfg, paths["fig_ablation_drop"], cfg["evaluation"]["figure_dpi"]
-        )
-    }
-    for key, figure in written.items():
-        logger.info("Wrote %s -> %s", key, figure)
-    return written
+    """Write the Task 6 ablation figure; empty when figures are disabled."""
+    return FigureSet([AblationPerformanceDrop(table, cfg)], cfg).render()
 
 
 def make_torch_figures(
@@ -1141,7 +672,7 @@ def make_torch_figures(
     figure_keys: tuple[str, ...] = const.TORCH_FIGURE_FILE_KEYS,
     model_label: str = const.TORCH_MODEL_NAME,
 ) -> dict[str, Path]:
-    """Write the Task 4 figures; returns the written paths (empty if disabled).
+    """Write the Task 4 figures for one network architecture.
 
     The baseline overlay is skipped rather than fabricated when the training
     stage has not been run, so a network run on its own still produces the two
@@ -1166,21 +697,8 @@ def make_torch_figures(
             f"figure_keys must hold {len(const.TORCH_FIGURE_FILE_KEYS)} keys "
             f"(learning curves, comparison, overlay), got {figure_keys}"
         )
-    if not cfg["evaluation"]["figures"]:
-        logger.info("evaluation.figures is false: skipping neural-network figures")
-        return {}
-    dpi = cfg["evaluation"]["figure_dpi"]
     curves_key, comparison_key, overlay_key = figure_keys
-    paths = _figure_paths(cfg, figure_keys)
-    written: dict[str, Path] = {}
-    if not history.empty:
-        written[curves_key] = plot_learning_curves(
-            history, fold_summary, paths[curves_key], dpi
-        )
-    if not comparison.empty:
-        written[comparison_key] = plot_model_comparison(
-            comparison, cfg, paths[comparison_key], dpi
-        )
+    baseline = pd.DataFrame()
     try:
         oof, _, selection = load_evaluation_inputs(cfg)
     except FileNotFoundError:
@@ -1189,13 +707,14 @@ def make_torch_figures(
         baseline = selected_oof(oof, selection, evaluation_strategy(cfg))
         if baseline.empty:
             logger.warning("No baseline OOF rows to compare against: skipping the overlay figure")
-        else:
-            written[overlay_key] = plot_baseline_vs_torch(
-                baseline, torch_oof, paths[overlay_key], dpi, model_label=model_label
-            )
-    for key, figure in written.items():
-        logger.info("Wrote %s -> %s", key, figure)
-    return written
+    return FigureSet(
+        [
+            LearningCurves(history, fold_summary, cfg, curves_key),
+            ModelComparison(comparison, cfg, comparison_key),
+            BaselineVsNetwork(baseline, torch_oof, cfg, overlay_key, model_label),
+        ],
+        cfg,
+    ).render()
 
 
 # =============================================================================

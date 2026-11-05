@@ -86,16 +86,25 @@ def fold_inputs(v2_cfg: dict[str, Any]) -> tuple[pd.DataFrame, list[Any], Featur
     return df, folds, features, config
 
 
+@pytest.fixture()
+def trainer(
+    v2_cfg: dict[str, Any], fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
+) -> v2.DualBranchTrainer:
+    """The trainer under test, wired exactly as the stage wires it."""
+    _, _, features, config = fold_inputs
+    return v2.DualBranchTrainer(v2_cfg, config, features)
+
+
 # =============================================================================
 # Branch preprocessing
 # =============================================================================
 def test_each_branch_gets_its_own_preprocessor(
-    v2_cfg: dict[str, Any], fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
+    trainer: v2.DualBranchTrainer, fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
 ) -> None:
     """The two blocks are transformed separately, which is what the branches need."""
-    df, _, features, config = fold_inputs
+    df, _, features, _ = fold_inputs
 
-    tabular_pre, embedding_pre = v2.build_branch_preprocessors(v2_cfg, features, config)
+    tabular_pre, embedding_pre = trainer.branch_preprocessors()
     x_tab = tabular_pre.fit_transform(df[features.tabular])
     x_emb = embedding_pre.fit_transform(df[features.embedding])
 
@@ -104,7 +113,7 @@ def test_each_branch_gets_its_own_preprocessor(
 
 
 def test_embedding_branch_skips_pca_by_default(
-    v2_cfg: dict[str, Any], fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
+    trainer: v2.DualBranchTrainer, fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
 ) -> None:
     """With ``embedding_pca: false`` the full embedding reaches the learned bottleneck.
 
@@ -115,7 +124,7 @@ def test_embedding_branch_skips_pca_by_default(
     df, _, features, config = fold_inputs
     assert config.embedding_pca is False
 
-    _, embedding_pre = v2.build_branch_preprocessors(v2_cfg, features, config)
+    _, embedding_pre = trainer.branch_preprocessors()
     x_emb = embedding_pre.fit_transform(df[features.embedding])
 
     assert x_emb.shape[1] == len(features.embedding)
@@ -130,20 +139,19 @@ def test_embedding_pca_can_be_turned_back_on(
     v2_cfg["torch_v2"]["embedding_pca"] = True
     config = dual_branch_config_from(v2_cfg)
 
-    _, embedding_pre = v2.build_branch_preprocessors(v2_cfg, features, config)
+    _, embedding_pre = v2.DualBranchTrainer(v2_cfg, config, features).branch_preprocessors()
     x_emb = embedding_pre.fit_transform(df[features.embedding])
 
     assert x_emb.shape[1] == TEST_N_COMPONENTS
 
 
 def test_building_preprocessors_does_not_mutate_the_config(
-    v2_cfg: dict[str, Any], fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
+    v2_cfg: dict[str, Any], trainer: v2.DualBranchTrainer
 ) -> None:
     """Disabling PCA for the embedding branch must not disable it project-wide."""
-    _, _, features, config = fold_inputs
     before = v2_cfg["features"]["embedding_reduction"]["enabled"]
 
-    v2.build_branch_preprocessors(v2_cfg, features, config)
+    trainer.branch_preprocessors()
 
     assert v2_cfg["features"]["embedding_reduction"]["enabled"] == before
 
@@ -153,11 +161,12 @@ def test_both_feature_blocks_are_required(
 ) -> None:
     """A single-block feature set cannot drive a two-branch model."""
     _, _, features, config = fold_inputs
+    crippled = v2.DualBranchTrainer(
+        v2_cfg, config, FeatureSet(tabular=features.tabular, embedding=[])
+    )
 
     with pytest.raises(ValueError, match="needs both feature blocks"):
-        v2.build_branch_preprocessors(
-            v2_cfg, FeatureSet(tabular=features.tabular, embedding=[]), config
-        )
+        crippled.branch_preprocessors()
 
 
 # =============================================================================
@@ -178,10 +187,10 @@ def test_preprocessors_never_see_the_outer_validation_fold(
     fold = folds[0]
     seen: list[pd.Index] = []
 
-    original = v2.build_branch_preprocessors
+    original = v2.DualBranchTrainer.branch_preprocessors
 
-    def recording(*args: Any, **kwargs: Any) -> Any:
-        tabular_pre, embedding_pre = original(*args, **kwargs)
+    def recording(self: v2.DualBranchTrainer) -> Any:
+        tabular_pre, embedding_pre = original(self)
         for transformer in (tabular_pre, embedding_pre):
             inner_fit = transformer.fit_transform
 
@@ -192,8 +201,8 @@ def test_preprocessors_never_see_the_outer_validation_fold(
             transformer.fit_transform = wrapped  # type: ignore[method-assign]
         return tabular_pre, embedding_pre
 
-    monkeypatch.setattr(v2, "build_branch_preprocessors", recording)
-    v2.train_one_fold(df, fold, features, v2_cfg, config)
+    monkeypatch.setattr(v2.DualBranchTrainer, "branch_preprocessors", recording)
+    v2.DualBranchTrainer(v2_cfg, config, features).train_one_fold(df, fold)
 
     train_labels = set(df.index[fold.train_idx])
     val_labels = set(df.index[fold.val_idx])
@@ -204,17 +213,17 @@ def test_preprocessors_never_see_the_outer_validation_fold(
 
 
 def test_the_inner_split_is_carved_out_of_the_training_fold(
-    v2_cfg: dict[str, Any], fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
+    trainer: v2.DualBranchTrainer, fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
 ) -> None:
     """Early stopping watches held-out rows that are still training-fold rows.
 
     Stopping on the outer validation fold would pick the epoch that scores
     best on the very rows used to report performance.
     """
-    df, folds, features, config = fold_inputs
+    df, folds, _, _ = fold_inputs
     fold = folds[0]
 
-    _, _, summary = v2.train_one_fold(df, fold, features, v2_cfg, config)
+    summary = trainer.train_one_fold(df, fold).summary
 
     n_inner = summary[const.TORCH_COL_N_INNER_TRAIN] + summary[const.TORCH_COL_N_INNER_VAL]
     assert n_inner == fold.train_idx.size
@@ -222,13 +231,14 @@ def test_the_inner_split_is_carved_out_of_the_training_fold(
 
 
 def test_the_target_scaler_is_fitted_on_inner_training_rows_only(
-    v2_cfg: dict[str, Any], fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
+    trainer: v2.DualBranchTrainer, fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
 ) -> None:
     """The stability mean/std come from a strict subset of the training fold."""
-    df, folds, features, config = fold_inputs
+    df, folds, _, _ = fold_inputs
     fold = folds[0]
 
-    (_, _, _, scaler), _, summary = v2.train_one_fold(df, fold, features, v2_cfg, config)
+    result = trainer.train_one_fold(df, fold)
+    scaler, summary = result.scaler, result.summary
 
     values = df[const.TARGET_STABILITY].to_numpy(dtype=float)
     assert scaler.enabled
@@ -237,14 +247,14 @@ def test_the_target_scaler_is_fitted_on_inner_training_rows_only(
 
 
 def test_predictions_are_returned_in_target_units(
-    v2_cfg: dict[str, Any], fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
+    trainer: v2.DualBranchTrainer, fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
 ) -> None:
     """Stability is inverse-transformed to kcal/mol; function stays inside 0-1."""
-    df, folds, features, config = fold_inputs
+    df, folds, _, _ = fold_inputs
     fold = folds[0]
-    artifacts, _, _ = v2.train_one_fold(df, fold, features, v2_cfg, config)
+    result = trainer.train_one_fold(df, fold)
 
-    stability, function = v2.predict_rows(artifacts, df.iloc[fold.val_idx], features, config)
+    stability, function = trainer.predict_rows(result, df.iloc[fold.val_idx])
 
     assert stability.shape == (fold.val_idx.size,)
     assert np.all(function >= 0) and np.all(function <= 1)
@@ -255,12 +265,13 @@ def test_predictions_are_returned_in_target_units(
 # Early stopping
 # =============================================================================
 def test_history_records_one_row_per_epoch(
-    v2_cfg: dict[str, Any], fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
+    trainer: v2.DualBranchTrainer, fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
 ) -> None:
     """The learning-curve artifact is one row per epoch with both losses."""
-    df, folds, features, config = fold_inputs
+    df, folds, _, _ = fold_inputs
 
-    _, history, summary = v2.train_one_fold(df, folds[0], features, v2_cfg, config)
+    result = trainer.train_one_fold(df, folds[0])
+    history, summary = result.history, result.summary
 
     assert list(history[const.TORCH_COL_EPOCH]) == list(range(1, len(history) + 1))
     assert len(history) <= TEST_MAX_EPOCHS
@@ -270,7 +281,7 @@ def test_history_records_one_row_per_epoch(
 
 
 def test_the_kept_epoch_is_the_best_one_not_the_last(
-    v2_cfg: dict[str, Any], fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
+    trainer: v2.DualBranchTrainer, fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
 ) -> None:
     """Weights are restored from the best inner-validation loss, within ``min_delta``.
 
@@ -278,9 +289,10 @@ def test_the_kept_epoch_is_the_best_one_not_the_last(
     if it beats the incumbent by more than ``min_delta``, so a later epoch
     that is lower by a hair deliberately does not displace it.
     """
-    df, folds, features, config = fold_inputs
+    df, folds, _, config = fold_inputs
 
-    _, history, summary = v2.train_one_fold(df, folds[0], features, v2_cfg, config)
+    result = trainer.train_one_fold(df, folds[0])
+    history, summary = result.history, result.summary
 
     losses = history.set_index(const.TORCH_COL_EPOCH)[const.TORCH_COL_VAL_LOSS]
     kept = float(losses.loc[summary[const.TORCH_COL_BEST_EPOCH]])
@@ -295,13 +307,13 @@ def test_the_kept_epoch_is_the_best_one_not_the_last(
 # Reproducibility
 # =============================================================================
 def test_two_runs_give_the_same_out_of_fold_predictions(
-    v2_cfg: dict[str, Any], fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
+    trainer: v2.DualBranchTrainer, fold_inputs: tuple[pd.DataFrame, list[Any], FeatureSet, Any]
 ) -> None:
     """Seed 20261102 makes the whole fold deterministic, weights included."""
-    df, folds, features, config = fold_inputs
+    df, folds, _, _ = fold_inputs
 
-    first, *_ = v2.cross_validate_dual_branch(df, folds, features, v2_cfg, config)
-    second, *_ = v2.cross_validate_dual_branch(df, folds, features, v2_cfg, config)
+    first, *_ = trainer.cross_validate(df, folds)
+    second, *_ = trainer.cross_validate(df, folds)
 
     assert np.allclose(
         first[const.COL_Y_PRED].to_numpy(dtype=float),
