@@ -77,7 +77,9 @@ Every stage is also runnable on its own, which is useful when iterating on one o
 python -m src.data_processing --config config/config.yaml   # merge, clean, engineer features
 python -m src.validation      --config config/config.yaml   # CV fold report and leakage audit
 python -m src.train           --config config/config.yaml   # train, select, save models
-python -m src.evaluate        --config config/config.yaml   # metrics report and figures
+python -m src.train_torch     --config config/config.yaml   # multitask NN, benchmarked vs baselines
+python -m src.train_torch_v2  --config config/config.yaml   # dual-branch NN, same folds
+python -m src.evaluate        --config config/config.yaml   # metrics, comparison, figures
 python -m src.predict         --config config/config.yaml   # score candidates, Top 10
 python -m src.ablation        --config config/config.yaml   # feature-subset ablation
 python -m src.interpret       --config config/config.yaml   # per-candidate write-up
@@ -90,7 +92,7 @@ Homebrew/PyPI build.
 Checks:
 
 ```bash
-python -m pytest -q        # 498 tests
+python -m pytest -q        # 704 tests
 python -m ruff check .
 python -m mypy src main.py
 ```
@@ -201,18 +203,24 @@ src/data_processing.py          Ingestion, merge with embeddings, anomaly checks
 src/model.py                    Model architectures: feature blocks, pipelines, registry
 src/validation.py               Random vs. protein-group vs. family-group CV
 src/train.py                    Fold-wise training, model selection, artifacts
-src/evaluate.py                 Metrics, optimism gap, figures, evaluation report
+src/evaluate.py                 Metrics, family/strategy comparison, optimism gap, figures
+src/torch_model.py              Multitask network: shared backbone, two task heads
+src/train_torch.py              Fold-local network training, early stopping, benchmark
+src/torch_model_v2.py           Dual-branch network: separate branches, residual fusion
+src/train_torch_v2.py           Fold-local dual-branch training, two branch preprocessors
 src/predict.py                  Ensemble inference, uncertainty, OOD flags, Top 10
 src/ablation.py                 Feature-subset ablation study
 src/interpret.py                Per-candidate scientific interpretation
-results/metrics/                CV metrics, OOF predictions, baseline benchmark, ablation
-results/figures/                Evaluation plots
+results/metrics/                CV metrics, OOF predictions, baseline benchmark, model
+                                comparison (CSV + JSON), ablation
+results/figures/                Fit and residual plots, strategy comparison, learning
+                                curves, baseline-vs-network comparison
 results/mutation_rankings/      Scored candidates, Top 10, candidate interpretation
-results/models/                 Fitted pipelines + training_metadata.json (provenance)
+results/models/                 Fitted pipelines, network weights, provenance metadata
 report/final_report.md          Source for the 6-page technical report
 report/final_report.pdf         The report deliverable (built by report/build_pdf.py)
 report/final_report_full.md     Extended version: full derivations, all candidate write-ups
-tests/                          498 tests, mirroring src/
+tests/                          704 tests, mirroring src/
 main.py                         End-to-end orchestration
 docs/CODING_GUIDELINES.md       Standards every change must follow
 ```

@@ -50,6 +50,10 @@ _BOOLEAN_KEYS = (
     "torch.batch_norm",
     "torch.standardize_stability_target",
     "torch.save_fold_models",
+    "torch_v2.batch_norm",
+    "torch_v2.standardize_stability_target",
+    "torch_v2.save_fold_models",
+    "torch_v2.embedding_pca",
     "prioritization.ood_flag_unseen_family",
     "models.refit_on_full_data",
     "models.save_fold_pipelines",
@@ -157,23 +161,40 @@ def _check_subset(cfg: dict[str, Any], dotted_key: str, allowed: list[str]) -> l
     return errors
 
 
-def _check_torch_layers(cfg: dict[str, Any]) -> list[str]:
-    """Return errors unless the network's layer widths are positive integers.
-
-    ``hidden_dims`` defines the shared backbone and must hold at least one
-    layer; ``head_hidden_dim`` may be ``null``, which makes each task head a
-    single ``Linear`` projection.
-    """
-    errors = []
-    dims = get_by_path(cfg, "torch.hidden_dims", None)
+def _check_layer_widths(cfg: dict[str, Any], dotted_key: str) -> list[str]:
+    """Return errors unless ``dotted_key`` holds a non-empty list of positive ints."""
+    dims = get_by_path(cfg, dotted_key, None)
     if not isinstance(dims, list) or not dims:
-        errors.append("torch.hidden_dims must be a non-empty list of layer widths")
-    elif any(not isinstance(d, int) or isinstance(d, bool) or d < 1 for d in dims):
-        errors.append(f"torch.hidden_dims must all be positive integers, got {dims}")
+        return [f"{dotted_key} must be a non-empty list of layer widths"]
+    if any(not isinstance(d, int) or isinstance(d, bool) or d < 1 for d in dims):
+        return [f"{dotted_key} must all be positive integers, got {dims}"]
+    return []
 
-    head = get_by_path(cfg, "torch.head_hidden_dim", None)
+
+def _check_head_width(cfg: dict[str, Any], dotted_key: str) -> list[str]:
+    """Return errors unless ``dotted_key`` is a positive int or ``null``."""
+    head = get_by_path(cfg, dotted_key, None)
     if head is not None and (not isinstance(head, int) or isinstance(head, bool) or head < 1):
-        errors.append(f"torch.head_hidden_dim must be a positive integer or null, got {head!r}")
+        return [f"{dotted_key} must be a positive integer or null, got {head!r}"]
+    return []
+
+
+def _check_torch_layers(cfg: dict[str, Any]) -> list[str]:
+    """Return errors unless both networks' layer widths are positive integers.
+
+    ``hidden_dims`` defines the v1 shared backbone and the v2 branches, and
+    each must hold at least one layer; a ``head_hidden_dim`` of ``null`` makes
+    each task head a single ``Linear`` projection.
+    """
+    errors: list[str] = []
+    for key in (
+        "torch.hidden_dims",
+        "torch_v2.tabular_branch.hidden_dims",
+        "torch_v2.embedding_branch.hidden_dims",
+    ):
+        errors.extend(_check_layer_widths(cfg, key))
+    for key in ("torch.head_hidden_dim", "torch_v2.head_hidden_dim"):
+        errors.extend(_check_head_width(cfg, key))
     return errors
 
 
@@ -261,6 +282,8 @@ def validate_config(cfg: dict[str, Any]) -> None:
     errors.extend(_check_choice(cfg, "features.embedding_reduction.method", _enum_values(ReductionMethod)))
     errors.extend(_check_choice(cfg, "torch.device", _enum_values(TorchDevice)))
     errors.extend(_check_choice(cfg, "torch.activation", _enum_values(Activation)))
+    errors.extend(_check_choice(cfg, "torch_v2.device", _enum_values(TorchDevice)))
+    errors.extend(_check_choice(cfg, "torch_v2.activation", _enum_values(Activation)))
     errors.extend(_check_torch_layers(cfg))
 
     candidates = get_by_path(cfg, "models.candidates", None)

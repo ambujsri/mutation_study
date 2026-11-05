@@ -41,7 +41,7 @@ import logging
 import platform
 import random
 from pathlib import Path
-from typing import Any
+from typing import Any, Protocol
 
 import joblib
 import numpy as np
@@ -55,7 +55,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from src.common import constants as const
 from src.common.config import DEFAULT_CONFIG_PATH, load_config, resolve_path, setup_logging
 from src.common.io import read_table, write_table
-from src.evaluate import compute_metrics, configured_metrics
+from src.evaluate import compute_metrics, configured_metrics, make_torch_figures
 from src.model import FeatureSet, build_preprocessor
 from src.torch_model import (
     ProteinMutationMultitaskNN,
@@ -117,8 +117,29 @@ def make_loader(x: Tensor, y_stability: Tensor, y_function: Tensor, config: Torc
 # =============================================================================
 # Inner split for early stopping
 # =============================================================================
+class InnerSplitSettings(Protocol):
+    """The two settings :func:`inner_split` needs from a training config.
+
+    Declared structurally so that both network architectures can share the
+    splitter without either one's config class depending on the other's. The
+    members are read-only properties because both config classes are frozen
+    dataclasses, whose attributes a settable protocol member would reject.
+    """
+
+    @property
+    def inner_val_fraction(self) -> float:
+        """Share of the training fold held out for early stopping."""
+
+    @property
+    def seed(self) -> int:
+        """Project random seed."""
+
+
 def inner_split(
-    df: pd.DataFrame, train_idx: np.ndarray, strategy: const.SplitStrategy, config: TorchConfig
+    df: pd.DataFrame,
+    train_idx: np.ndarray,
+    strategy: const.SplitStrategy,
+    config: InnerSplitSettings,
 ) -> tuple[np.ndarray, np.ndarray]:
     """Split the training fold into inner-train and inner-validation rows.
 
@@ -203,7 +224,7 @@ class TargetScaler:
 # =============================================================================
 # Training one fold
 # =============================================================================
-def _to_tensor(values: np.ndarray, device: str) -> Tensor:
+def to_tensor(values: np.ndarray, device: str) -> Tensor:
     """Float32 tensor on the target device."""
     return torch.as_tensor(np.asarray(values, dtype=np.float32), device=device)
 
@@ -255,13 +276,13 @@ def train_one_fold(
     def targets(idx: np.ndarray) -> tuple[Tensor, Tensor]:
         stability = scaler.transform(df[TARGET_STABILITY].to_numpy(dtype=float)[idx])
         function = df[TARGET_FUNCTION].to_numpy(dtype=float)[idx]
-        return _to_tensor(stability, config.device), _to_tensor(function, config.device)
+        return to_tensor(stability, config.device), to_tensor(function, config.device)
 
     train_loader = make_loader(
-        _to_tensor(x_inner_train, config.device), *targets(inner_train_idx), config, shuffle=True
+        to_tensor(x_inner_train, config.device), *targets(inner_train_idx), config, shuffle=True
     )
     val_loader = make_loader(
-        _to_tensor(x_inner_val, config.device), *targets(inner_val_idx), config, shuffle=False
+        to_tensor(x_inner_val, config.device), *targets(inner_val_idx), config, shuffle=False
     )
 
     model = ProteinMutationMultitaskNN(x_inner_train.shape[1], config).to(config.device)
@@ -283,7 +304,9 @@ def train_one_fold(
             )
             loss.backward()
             optimizer.step()
-            running += float(loss) * batch_x.shape[0]
+            # Detached before the cast: the running total is a log value, and
+            # keeping it attached to the graph would retain the whole epoch.
+            running += loss.detach().item() * batch_x.shape[0]
             n_rows += batch_x.shape[0]
         train_loss = running / max(n_rows, 1)
         val_loss = _evaluate_loss(model, val_loader, config)
@@ -339,7 +362,7 @@ def predict_rows(
 ) -> tuple[np.ndarray, np.ndarray]:
     """Predict both targets for ``frame``, returning stability in kcal/mol."""
     model.eval()
-    x = _to_tensor(preprocessor.transform(frame[features.all]), config.device)
+    x = to_tensor(preprocessor.transform(frame[features.all]), config.device)
     with torch.no_grad():
         stability, function = model(x)
     return (
@@ -437,16 +460,30 @@ def summarize_torch_metrics(oof: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFr
     return pd.DataFrame(rows)
 
 
-def compare_with_baselines(torch_summary: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
-    """Place the network beside the sklearn baselines on the same folds.
+def compare_with_baselines(
+    torch_summary: pd.DataFrame,
+    cfg: dict[str, Any],
+    model_name: str = const.TORCH_MODEL_NAME,
+    reference: pd.DataFrame | None = None,
+) -> pd.DataFrame:
+    """Place a network beside the other models on the same folds.
 
     Reads the baseline metrics `src/train.py` saved rather than refitting, so
     the comparison cannot disagree with the published baseline numbers.
 
+    Args:
+        torch_summary: Pooled metrics for the network being placed.
+        cfg: Loaded configuration.
+        model_name: The network's name in the metrics tables; every other row
+            counts as a reference model it is measured against.
+        reference: Extra reference rows to compare against on top of the
+            sklearn baselines — used by the dual-branch run to measure itself
+            against the first network as well.
+
     Returns:
         One row per target per model under the evaluated strategy, with the
-        network's signed difference against the **best** baseline for that
-        target. An empty frame if the baselines have not been run.
+        network's signed difference against the **best** reference model for
+        that target. An empty frame if no reference metrics exist.
     """
     path = resolve_path(cfg, "metrics_dir", "cv_metrics_summary")
     if not path.is_file():
@@ -454,6 +491,8 @@ def compare_with_baselines(torch_summary: pd.DataFrame, cfg: dict[str, Any]) -> 
         return pd.DataFrame()
 
     baselines = read_table(path)
+    if reference is not None and not reference.empty:
+        baselines = pd.concat([baselines, reference], ignore_index=True)
     strategy = torch_summary[const.CV_COL_STRATEGY].iloc[0]
     baselines = baselines[baselines[const.CV_COL_STRATEGY] == strategy]
     combined = pd.concat([baselines, torch_summary], ignore_index=True)
@@ -466,7 +505,7 @@ def compare_with_baselines(torch_summary: pd.DataFrame, cfg: dict[str, Any]) -> 
     rows = []
     for target in const.TARGETS.values():
         target_rows = combined[combined[const.COL_TARGET] == target]
-        baseline_rows = target_rows[target_rows[const.COL_MODEL] != const.TORCH_MODEL_NAME]
+        baseline_rows = target_rows[target_rows[const.COL_MODEL] != model_name]
         if baseline_rows.empty:
             continue
         best = (
@@ -496,7 +535,7 @@ def compare_with_baselines(torch_summary: pd.DataFrame, cfg: dict[str, Any]) -> 
             best[const.COL_MODEL],
             column,
             best[column],
-            const.TORCH_MODEL_NAME,
+            model_name,
             float(torch_summary[torch_summary[const.COL_TARGET] == target][column].iloc[0]),
         )
     return pd.DataFrame(rows)
@@ -618,7 +657,7 @@ def save_artifacts(
             "n_parameters": count_parameters(example) if example is not None else None,
         },
         "optimization": {
-            "optimizer": "adam",
+            "optimizer": const.TORCH_OPTIMIZER_NAME,
             "learning_rate": config.learning_rate,
             "weight_decay": config.weight_decay,
             "batch_size": config.batch_size,
@@ -686,7 +725,13 @@ def run_torch_training(cfg: dict[str, Any]) -> tuple[pd.DataFrame, pd.DataFrame]
     save_artifacts(
         oof, summary, history, fold_summary, comparison, artifacts, features, cfg, config
     )
-    logger.info("Task 4 complete: %d folds, %d out-of-fold predictions", len(folds), len(oof))
+    figures = make_torch_figures(oof, history, fold_summary, comparison, cfg)
+    logger.info(
+        "Task 4 complete: %d folds, %d out-of-fold predictions, %d figures",
+        len(folds),
+        len(oof),
+        len(figures),
+    )
     return summary, comparison
 
 

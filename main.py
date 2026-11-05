@@ -3,8 +3,8 @@
 Runs the stages in dependency order, each of which is also runnable on its own
 as ``python -m src.<stage>``:
 
-    data_processing -> validation -> train -> evaluate -> train_torch
-                                  -> predict -> ablation -> interpret
+    data_processing -> validation -> train -> train_torch -> train_torch_v2
+                                  -> evaluate -> predict -> ablation -> interpret
 
 Every stage reads its inputs from, and writes its outputs to, the locations in
 ``config/config.yaml``; this module adds no behaviour of its own beyond
@@ -62,14 +62,26 @@ def _torch_stage(cfg: dict[str, Any]) -> None:
     run_torch_training(cfg)
 
 
+def _torch_v2_stage(cfg: dict[str, Any]) -> None:
+    """Train and benchmark the dual-branch network (same lazy-import reasoning)."""
+    from src.train_torch_v2 import run_dual_branch_training
+
+    run_dual_branch_training(cfg)
+
+
 # Stage name -> entry point. Order is the dependency order: a stage may rely on
 # the artifacts of any stage above it, never below.
 STAGES: dict[str, Callable[[dict[str, Any]], Any]] = {
     "data_processing": run_preprocessing,
     "validation": run_validation_harness,
     "train": run_training,
-    "evaluate": run_evaluation,
+    # The network runs before evaluation, not after: Task 5 compares model
+    # families, and the neural network is one of them, so its metrics must
+    # exist by the time the comparison table is built.
     "train_torch": _torch_stage,
+    # v2 runs after v1 so its comparison table can measure itself against it.
+    "train_torch_v2": _torch_v2_stage,
+    "evaluate": run_evaluation,
     "predict": run_prediction,
     "ablation": _ablation_stage,
     "interpret": run_interpretation,

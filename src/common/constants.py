@@ -281,6 +281,19 @@ CONFIG_BOUNDS: Final = MappingProxyType(
         "torch.early_stopping.min_delta": Bound(0, None),
         "torch.loss_weights.stability": Bound(0, None),
         "torch.loss_weights.function": Bound(0, None),
+        "torch_v2.embedding_branch.bottleneck_dim": Bound(1, EMBEDDING_DIM, integer=True),
+        "torch_v2.fusion.hidden_dim": Bound(1, None, integer=True),
+        "torch_v2.fusion.n_residual_blocks": Bound(1, None, integer=True),
+        "torch_v2.dropout": Bound(0, 1),
+        "torch_v2.batch_size": Bound(1, None, integer=True),
+        "torch_v2.max_epochs": Bound(1, None, integer=True),
+        "torch_v2.optimizer.learning_rate": Bound(0, 1, low_open=True),
+        "torch_v2.optimizer.weight_decay": Bound(0, None),
+        "torch_v2.early_stopping.inner_val_fraction": Bound(0, 1, low_open=True),
+        "torch_v2.early_stopping.patience": Bound(1, None, integer=True),
+        "torch_v2.early_stopping.min_delta": Bound(0, None),
+        "torch_v2.loss_weights.stability": Bound(0, None),
+        "torch_v2.loss_weights.function": Bound(0, None),
         "models.candidates.ridge.alpha": Bound(0, None, low_open=True),
         "models.candidates.random_forest.n_estimators": Bound(1, None, integer=True),
         "models.candidates.random_forest.min_samples_leaf": Bound(1, None, integer=True),
@@ -448,6 +461,19 @@ FEATURE_GROUPS: Final = MappingProxyType(
 # =============================================================================
 EVAL_COL_METRIC: Final = "metric"
 EVAL_COL_OPTIMISM_GAP: Final = "optimism_gap"  # random-split score minus grouped-split score
+EVAL_COL_MODEL_FAMILY: Final = "model_family"
+# Per-metric gap columns in the unified comparison table, e.g. `optimism_gap_r2`.
+EVAL_OPTIMISM_GAP_PREFIX: Final = f"{EVAL_COL_OPTIMISM_GAP}_"
+
+# Which family of estimator each model belongs to. The comparison in Task 5 is
+# between *families* — a penalised linear fit, a bagged tree ensemble, a boosted
+# tree ensemble, a neural network — not between arbitrary names, so the grouping
+# lives beside the names rather than being inferred from them.
+MODEL_FAMILY_LINEAR: Final = "linear"
+MODEL_FAMILY_TREE_BAGGING: Final = "tree_ensemble_bagging"
+MODEL_FAMILY_TREE_BOOSTING: Final = "tree_ensemble_boosting"
+MODEL_FAMILY_NEURAL: Final = "neural_network"
+MODEL_FAMILY_UNKNOWN: Final = "unknown"
 
 # Figure artifacts, keyed by their entry in the config `files` section. Adding a
 # figure means adding its key here and a filename in config.yaml.
@@ -457,6 +483,12 @@ FIGURE_FILE_KEYS: Final = ("fig_pred_vs_actual", "fig_residuals", "fig_strategy_
 MATPLOTLIB_BACKEND: Final = "Agg"
 RESIDUAL_HIST_BINS: Final = 30
 FIGURE_XTICK_ROTATION: Final = 20
+# Two distributions are drawn on one axis in the baseline-vs-network figure, so
+# both must stay visible where they overlap.
+FIGURE_OVERLAY_ALPHA: Final = 0.55
+FIGURE_SCATTER_ALPHA: Final = 0.5
+# Learning curves are laid out one panel per fold, wrapped at this many columns.
+LEARNING_CURVE_COLUMNS: Final = 3
 
 # =============================================================================
 # PyTorch multitask model (assignment Task 4)
@@ -484,6 +516,58 @@ TORCH_COL_N_INNER_VAL: Final = "n_inner_val"
 # Comparison table against the sklearn baselines.
 TORCH_COL_DELTA_PREFIX: Final = "delta_vs_best_baseline_"
 
+# Optimiser recorded in the provenance metadata. Both networks use Adam; the
+# name is here so the record and the code cannot drift apart.
+TORCH_OPTIMIZER_NAME: Final = "adam"
+
+# Figures written by the Task 4 stage. Kept separate from FIGURE_FILE_KEYS
+# because `src.evaluate` runs before the network and cannot draw these.
+TORCH_FIGURE_FILE_KEYS: Final = (
+    "fig_torch_learning_curves",
+    "fig_model_comparison",
+    "fig_baseline_vs_torch",
+)
+
+# =============================================================================
+# Dual-branch network (Task 4, second architecture)
+# =============================================================================
+# The v1 network concatenates everything into one input vector. v2 routes the
+# tabular block and the embedding block down separate branches, so the name has
+# to distinguish them in every metrics table.
+TORCH_V2_MODEL_NAME: Final = "dual_branch_nn"
+TORCH_V2_MODELS_SUBDIR: Final = "torch_v2"
+TORCH_V2_FOLD_MODEL_TEMPLATE: Final = "{strategy}__fold{fold}__dual_branch_nn.pt"
+TORCH_V2_TABULAR_PREPROCESSOR_TEMPLATE: Final = (
+    "{strategy}__fold{fold}__dual_branch_nn__tabular.joblib"
+)
+TORCH_V2_EMBEDDING_PREPROCESSOR_TEMPLATE: Final = (
+    "{strategy}__fold{fold}__dual_branch_nn__embedding.joblib"
+)
+TORCH_V2_METADATA_FILE: Final = "torch_v2_training_metadata.json"
+TORCH_V2_FIGURE_FILE_KEYS: Final = (
+    "fig_torch_v2_learning_curves",
+    "fig_model_comparison_v2",
+    "fig_baseline_vs_torch_v2",
+)
+# Branch identifiers used in the parameter-count provenance record.
+TORCH_V2_BRANCH_TABULAR: Final = "tabular_branch"
+TORCH_V2_BRANCH_EMBEDDING: Final = "embedding_branch"
+TORCH_V2_BRANCH_FUSION: Final = "fusion"
+TORCH_V2_BRANCH_HEADS: Final = "heads"
+
+# Model name -> estimator family, for the Task 5 comparison. Declared here,
+# after the neural networks' names, so every model the pipeline can produce is
+# classified in one place.
+MODEL_FAMILIES: Final = MappingProxyType(
+    {
+        ModelName.RIDGE.value: MODEL_FAMILY_LINEAR,
+        ModelName.RANDOM_FOREST.value: MODEL_FAMILY_TREE_BAGGING,
+        ModelName.GRADIENT_BOOSTING.value: MODEL_FAMILY_TREE_BOOSTING,
+        TORCH_MODEL_NAME: MODEL_FAMILY_NEURAL,
+        TORCH_V2_MODEL_NAME: MODEL_FAMILY_NEURAL,
+    }
+)
+
 # Ablation report schema.
 ABL_COL_SUBSET: Final = "subset"
 ABL_COL_GROUPS: Final = "groups"
@@ -505,6 +589,7 @@ REQUIRED_CONFIG_SECTIONS: Final = (
     "validation",
     "models",
     "torch",
+    "torch_v2",
     "evaluation",
     "ablation",
     "interpretation",

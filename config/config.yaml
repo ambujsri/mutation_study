@@ -41,6 +41,8 @@ files:
   cv_metrics_summary: cv_metrics_summary.csv        # pooled OOF + fold mean/std metrics
   model_selection: model_selection.json             # chosen model per target and why
   evaluation_markdown: evaluation_summary.md        # headline metrics + optimism gap
+  evaluation_json: evaluation_summary.json          # same report, machine-readable
+  model_comparison: model_comparison.csv            # every model family x target x strategy
   baseline_benchmark: baseline_benchmark.csv        # every model x target x strategy
   baseline_benchmark_markdown: baseline_benchmark.md  # same, for the technical report
   torch_oof_predictions: torch_oof_predictions.parquet  # neural-net out-of-fold predictions
@@ -49,6 +51,12 @@ files:
   torch_fold_summary: torch_fold_summary.csv        # early-stopping epoch per fold
   torch_comparison: torch_vs_baselines.csv          # neural net against the sklearn baselines
   torch_comparison_markdown: torch_vs_baselines.md  # same, for the technical report
+  torch_v2_oof_predictions: torch_v2_oof_predictions.parquet  # dual-branch OOF predictions
+  torch_v2_cv_metrics: torch_v2_cv_metrics.csv      # dual-branch pooled + per-fold metrics
+  torch_v2_history: torch_v2_training_history.csv   # loss per fold x epoch
+  torch_v2_fold_summary: torch_v2_fold_summary.csv  # early-stopping epoch per fold
+  torch_v2_comparison: torch_v2_vs_baselines.csv    # dual-branch against every other model
+  torch_v2_comparison_markdown: torch_v2_vs_baselines.md  # same, for the technical report
   ablation_study: ablation_study.csv                # feature-subset ablation metrics
   ablation_markdown: ablation_study.md              # same, for the technical report
   # models_dir
@@ -57,6 +65,12 @@ files:
   fig_pred_vs_actual: pred_vs_actual.png            # out-of-fold predictions vs ground truth
   fig_residuals: residual_distribution.png          # residual histogram per target
   fig_strategy_comparison: strategy_comparison.png  # selection metric by CV strategy
+  fig_torch_learning_curves: torch_learning_curves.png  # train/inner-val loss per fold x epoch
+  fig_model_comparison: model_comparison.png        # every metric, baselines vs the neural net
+  fig_baseline_vs_torch: baseline_vs_nn_fit.png     # fit and residuals, best baseline vs the net
+  fig_torch_v2_learning_curves: torch_v2_learning_curves.png  # dual-branch loss per fold x epoch
+  fig_model_comparison_v2: model_comparison_v2.png  # every metric, all models incl. dual-branch
+  fig_baseline_vs_torch_v2: baseline_vs_dual_branch_fit.png  # fit and residuals vs the baseline
   # rankings_dir
   top_candidates: top_10_candidates.csv             # Top-K prioritization table
   top_candidates_markdown: top_10_candidates.md     # same table for the technical report
@@ -162,6 +176,54 @@ torch:
   standardize_stability_target: true
   # auto resolves to cpu: MPS/CUDA kernels are not bit-reproducible.
   device: auto                         # auto | cpu | mps | cuda
+  save_fold_models: true
+
+# -----------------------------------------------------------------------------
+# Dual-branch network (src/torch_model_v2.py, src/train_torch_v2.py)
+# Same folds, same leakage rules, different architecture: the tabular block and
+# the embedding block travel down separate branches and meet at a fusion trunk.
+# -----------------------------------------------------------------------------
+torch_v2:
+  # Branch 1: localized physicochemical deltas, conservation, accessibility,
+  # secondary structure. These carry the mutation-specific signal.
+  tabular_branch:
+    hidden_dims: [128, 64]
+  # Branch 2: the 256-d protein embedding, squeezed through a learned
+  # bottleneck. The ablation shows embeddings alone score a NEGATIVE rank
+  # correlation under family-grouped CV, so the branch's job is to pass through
+  # the little that generalises and discard the family-identity signal.
+  embedding_branch:
+    bottleneck_dim: 32
+    hidden_dims: [64]
+  # Replace the fold-local PCA with the learned bottleneck above. Set true to
+  # keep PCA as well, which stacks two reductions and is rarely what you want.
+  embedding_pca: false
+  # Fusion trunk: concatenated branches -> residual blocks -> heads.
+  fusion:
+    hidden_dim: 128
+    n_residual_blocks: 2
+  head_hidden_dim: 32
+  activation: relu                     # relu | gelu
+  batch_norm: true
+  dropout: 0.3
+  optimizer:
+    learning_rate: 0.0001
+    weight_decay: 0.0001
+  batch_size: 32
+  max_epochs: 300
+  early_stopping:
+    inner_val_fraction: 0.2
+    patience: 25
+    min_delta: 0.0001
+  # v1 weighted the two tasks equally, which let the unbounded stability target
+  # dominate: functional_score lives on 0-1, so its MSE is ~30x smaller and
+  # contributes almost nothing to the gradient. Weighting the function task up
+  # is the correction; see report/final_report.md.
+  loss_weights:
+    stability: 0.3
+    function: 0.7
+  standardize_stability_target: true
+  device: auto
   save_fold_models: true
 
 # -----------------------------------------------------------------------------

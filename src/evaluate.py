@@ -348,19 +348,311 @@ def benchmark_to_markdown(table: pd.DataFrame, cfg: dict[str, Any]) -> str:
 
 
 # =============================================================================
+# Comparative analysis across model families and splitting strategies (Task 5)
+# =============================================================================
+def unified_summary(cfg: dict[str, Any]) -> pd.DataFrame:
+    """Concatenate the sklearn baselines' metrics with the neural network's.
+
+    Both stages write the same schema — one row per strategy × model × target
+    with ``pooled_*``, ``fold_mean_*`` and ``fold_std_*`` columns — so the two
+    tables stack without reconciliation. The network's file is optional: Task 5
+    reports on whatever has been trained, and says in the log what is missing
+    rather than silently presenting a partial comparison as a complete one.
+    """
+    tables = [read_table(resolve_path(cfg, "metrics_dir", "cv_metrics_summary"))]
+    for key, module in (
+        ("torch_cv_metrics", "src.train_torch"),
+        ("torch_v2_cv_metrics", "src.train_torch_v2"),
+    ):
+        path = resolve_path(cfg, "metrics_dir", key)
+        if not path.is_file():
+            logger.info("No metrics at %s: run `python -m %s` to include it", path, module)
+            continue
+        network = read_table(path)
+        logger.info("Including %d rows from %s in the comparison", len(network), path.name)
+        tables.append(network)
+    return pd.concat(tables, ignore_index=True) if len(tables) > 1 else tables[0]
+
+
+def model_comparison_table(summary: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
+    """Build the single table Task 5 is judged on: every model × target × strategy.
+
+    This is the join of the two comparative axes the assignment asks for:
+
+    * **model family** — a penalised linear fit, two tree ensembles and a
+      neural network, each identified by ``model_family`` so the comparison is
+      between kinds of estimator rather than between names; and
+    * **splitting strategy** — the same model under the optimistic random split
+      and under the grouped splits, with an ``optimism_gap_<metric>`` column
+      per metric giving the random split's score minus this row's.
+
+    Every metric gets its own gap column, not just the selection metric,
+    because the inflation is not uniform across metrics: a random split can
+    leave RMSE almost unchanged while adding a great deal to R², since the
+    latter is scored against the variance of a validation set that has itself
+    been made easier.
+
+    Nothing is refit. The table is a reshaping of the saved out-of-fold
+    metrics, so it cannot disagree with the numbers the training stages logged.
+
+    Returns:
+        Rows ordered by target, then config model order, then strategy order,
+        with ``NaN`` gaps on the random-split rows themselves.
+    """
+    metrics = configured_metrics(cfg)
+    strategies = [s for s in cfg["validation"]["strategies"] if s in set(summary[const.CV_COL_STRATEGY])]
+    configured_models = [
+        *cfg["models"]["candidates"],
+        const.TORCH_MODEL_NAME,
+        const.TORCH_V2_MODEL_NAME,
+    ]
+    models = [m for m in configured_models if m in set(summary[const.COL_MODEL])]
+    random_ = const.SplitStrategy.RANDOM.value
+
+    indexed = summary.set_index([const.COL_TARGET, const.COL_MODEL, const.CV_COL_STRATEGY])
+    rows = []
+    for target in const.TARGETS.values():
+        for model in models:
+            for strategy in strategies:
+                key = (target, model, strategy)
+                if key not in indexed.index:
+                    continue
+                row = indexed.loc[key]
+                record: dict[str, Any] = {
+                    const.COL_TARGET: target,
+                    const.COL_MODEL: model,
+                    const.EVAL_COL_MODEL_FAMILY: const.MODEL_FAMILIES.get(
+                        model, const.MODEL_FAMILY_UNKNOWN
+                    ),
+                    const.CV_COL_STRATEGY: strategy,
+                    const.COL_N_SAMPLES: int(row[const.COL_N_SAMPLES]),
+                }
+                optimistic = (target, model, random_)
+                for metric in metrics:
+                    pooled = f"{const.POOLED_PREFIX}{metric.value}"
+                    fold_std = f"{const.FOLD_STD_PREFIX}{metric.value}"
+                    record[pooled] = float(row[pooled])
+                    record[fold_std] = float(row[fold_std]) if fold_std in row else float("nan")
+                    record[f"{const.EVAL_OPTIMISM_GAP_PREFIX}{metric.value}"] = (
+                        float(indexed.loc[optimistic, pooled]) - float(row[pooled])
+                        if optimistic in indexed.index and strategy != random_
+                        else float("nan")
+                    )
+                rows.append(record)
+    return pd.DataFrame(rows)
+
+
+def family_leaderboard(comparison: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
+    """Rank the model families on the reported strategy, best first per target.
+
+    Ranking happens *within* a target because the two targets are on different
+    scales and are not jointly orderable, and only on the reported strategy
+    because ranking models on the optimistic split is how one ends up shipping
+    the model that memorises best.
+    """
+    strategy = evaluation_strategy(cfg)
+    selection = const.Metric(cfg["models"]["selection_metric"])
+    column = f"{const.POOLED_PREFIX}{selection.value}"
+    ascending = not const.METRIC_GREATER_IS_BETTER[selection]
+
+    rows = comparison[comparison[const.CV_COL_STRATEGY] == strategy]
+    ranked = []
+    for target in const.TARGETS.values():
+        target_rows = rows[rows[const.COL_TARGET] == target].sort_values(column, ascending=ascending)
+        target_rows = target_rows.assign(rank=range(1, len(target_rows) + 1))
+        ranked.append(target_rows)
+    if not ranked:
+        return pd.DataFrame()
+    return pd.concat(ranked, ignore_index=True)
+
+
+def interpretation_notes(comparison: pd.DataFrame, cfg: dict[str, Any]) -> list[str]:
+    """Generate the scientific commentary from the numbers actually measured.
+
+    The sentences are assembled from this run's values rather than written as
+    fixed prose, so the discussion cannot drift out of step with the tables
+    beside it when the pipeline is re-run on different data.
+    """
+    notes: list[str] = []
+    strategy = evaluation_strategy(cfg)
+    selection = cfg["models"]["selection_metric"]
+    gap_column = f"{const.EVAL_OPTIMISM_GAP_PREFIX}{selection}"
+    reported = comparison[comparison[const.CV_COL_STRATEGY] == strategy]
+
+    if gap_column in reported and reported[gap_column].notna().any():
+        worst = reported.loc[reported[gap_column].idxmax()]
+        notes.append(
+            f"**Why the family-aware split scores lower.** Across every model the random split "
+            f"reports a higher `{selection}` than `{strategy}`; the largest inflation is "
+            f"{float(worst[gap_column]):+.3f} for `{worst[const.COL_MODEL]}` on "
+            f"`{worst[const.COL_TARGET]}`. A random split scatters mutations of the same protein "
+            "across the train and validation sides, so a model can recognise the protein it is "
+            "scoring and recall the average effect of mutating it. The family-grouped split "
+            "withholds entire evolutionary families, so the model must extrapolate to a fold "
+            "and a structural context it has never seen, and the family-level baseline effect "
+            "it would otherwise lean on is unavailable. The grouped number is the honest "
+            "estimate for the assignment's candidates, which are unlabelled proteins the model "
+            "has not been trained on."
+        )
+
+    pearson = f"{const.POOLED_PREFIX}{const.Metric.PEARSON.value}"
+    spearman = f"{const.POOLED_PREFIX}{const.Metric.SPEARMAN.value}"
+    if pearson in reported and spearman in reported and not reported.empty:
+        divergence = (reported[spearman] - reported[pearson]).abs()
+        row = reported.loc[divergence.idxmax()]
+        notes.append(
+            f"**Pearson vs Spearman.** Pearson measures how close the relationship is to a "
+            f"straight line and is therefore sensitive to a few badly-placed extreme values; "
+            f"Spearman measures only whether the ordering is right. The widest divergence here "
+            f"is `{row[const.COL_MODEL]}` on `{row[const.COL_TARGET]}`, at "
+            f"{float(row[pearson]):.3f} Pearson against {float(row[spearman]):.3f} Spearman. "
+            "For this project Spearman is the one that matters: the deliverable is a ranked "
+            "shortlist of candidates to take into the wet lab, so being right about which "
+            "mutation is more promising counts for more than being numerically calibrated."
+        )
+
+    r2 = f"{const.POOLED_PREFIX}{const.Metric.R2.value}"
+    if r2 in reported and (reported[r2] < 0).any():
+        losers = reported[reported[r2] < 0]
+        names = ", ".join(
+            f"`{m}` on `{t}`"
+            for m, t in zip(losers[const.COL_MODEL], losers[const.COL_TARGET], strict=True)
+        )
+        verb = "scores" if len(losers) == 1 else "score"
+        notes.append(
+            f"**Negative R².** {names} {verb} below zero, meaning the predictions are worse than "
+            "simply predicting the training mean. A negative R² alongside a positive rank "
+            "correlation says the model has some signal about ordering but is badly "
+            "mis-calibrated in magnitude; a negative R² with near-zero rank correlation says "
+            "it has not learned the target at all."
+        )
+    return notes
+
+
+def comparison_to_markdown(
+    comparison: pd.DataFrame, leaderboard: pd.DataFrame, notes: list[str], cfg: dict[str, Any]
+) -> str:
+    """Render the Task 5 comparative analysis as a Markdown section."""
+    strategy = evaluation_strategy(cfg)
+    selection = cfg["models"]["selection_metric"]
+    families = ", ".join(dict.fromkeys(comparison[const.EVAL_COL_MODEL_FAMILY]))
+    lines = [
+        "# Comparative evaluation",
+        "",
+        f"- Model families compared: {families}",
+        f"- Splitting strategies compared: "
+        f"{', '.join(dict.fromkeys(comparison[const.CV_COL_STRATEGY]))}",
+        f"- Reported strategy: `{strategy}`; ranking metric: "
+        f"`{const.POOLED_PREFIX}{selection}`",
+        "",
+        f"`{const.EVAL_OPTIMISM_GAP_PREFIX}<metric>` is the random split's score for that model "
+        "and target minus this row's, so a positive gap is the credit the optimistic split "
+        "awards for recognising proteins and families already seen in training.",
+        "",
+    ]
+    if not leaderboard.empty:
+        keep = [
+            const.COL_MODEL,
+            const.EVAL_COL_MODEL_FAMILY,
+            "rank",
+            f"{const.POOLED_PREFIX}{selection}",
+        ]
+        for target in const.TARGETS.values():
+            rows = leaderboard[leaderboard[const.COL_TARGET] == target]
+            if rows.empty:
+                continue
+            lines += [
+                f"## {target}: family ranking under `{strategy}`",
+                "",
+                rows[keep].to_markdown(index=False, floatfmt=const.MARKDOWN_FLOAT_FORMAT),
+                "",
+            ]
+    for target in const.TARGETS.values():
+        rows = comparison[comparison[const.COL_TARGET] == target]
+        if rows.empty:
+            continue
+        lines += [
+            f"## {target}: all models, all strategies",
+            "",
+            rows.drop(columns=const.COL_TARGET).to_markdown(
+                index=False, floatfmt=const.MARKDOWN_FLOAT_FORMAT
+            ),
+            "",
+        ]
+    if notes:
+        lines += ["## Interpretation", ""]
+        for note in notes:
+            lines += [note, ""]
+    return "\n".join(lines) + "\n"
+
+
+def evaluation_record(
+    headline: pd.DataFrame,
+    comparison: pd.DataFrame,
+    leaderboard: pd.DataFrame,
+    gaps: pd.DataFrame,
+    notes: list[str],
+    figures: dict[str, Path],
+    cfg: dict[str, Any],
+) -> dict[str, Any]:
+    """Assemble the machine-readable evaluation summary.
+
+    The JSON mirrors the Markdown rather than adding to it, so a downstream
+    consumer and a human reader cannot be looking at different conclusions.
+    """
+    return {
+        "random_seed": cfg["project"]["random_seed"],
+        "reported_strategy": evaluation_strategy(cfg),
+        "selection_metric": f"{const.POOLED_PREFIX}{cfg['models']['selection_metric']}",
+        "metrics": [metric.value for metric in configured_metrics(cfg)],
+        "targets": list(const.TARGETS.values()),
+        "model_families": {
+            model: const.MODEL_FAMILIES.get(model, const.MODEL_FAMILY_UNKNOWN)
+            for model in dict.fromkeys(comparison[const.COL_MODEL])
+        },
+        "selected_models": headline.to_dict(orient="records"),
+        "family_ranking": leaderboard.to_dict(orient="records"),
+        "model_comparison": comparison.to_dict(orient="records"),
+        "optimism_gap": gaps.to_dict(orient="records"),
+        "interpretation": notes,
+        "figures": {key: path.name for key, path in figures.items()},
+    }
+
+
+# =============================================================================
 # Figures
 # =============================================================================
-def _figure_paths(cfg: dict[str, Any]) -> dict[str, Path]:
+def _figure_paths(cfg: dict[str, Any], keys: tuple[str, ...] = const.FIGURE_FILE_KEYS) -> dict[str, Path]:
     """Resolve the configured figure filenames under ``paths.figures_dir``."""
-    return {key: resolve_path(cfg, "figures_dir", key) for key in const.FIGURE_FILE_KEYS}
+    return {key: resolve_path(cfg, "figures_dir", key) for key in keys}
 
 
-def plot_predicted_vs_actual(oof: pd.DataFrame, path: Path, dpi: int) -> Path:
-    """Scatter OOF prediction against ground truth, one panel per target."""
+def _pyplot() -> Any:
+    """Import pyplot against the non-interactive backend.
+
+    Deferred to call time, and to each plotting function, so that importing
+    this module costs nothing on a headless machine or when figures are off.
+    """
     import matplotlib
 
     matplotlib.use(const.MATPLOTLIB_BACKEND)
     import matplotlib.pyplot as plt
+
+    return plt
+
+
+def _save(fig: Any, path: Path, dpi: int) -> Path:
+    """Write ``fig`` to ``path``, creating the directory, and close it."""
+    fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    fig.savefig(path, dpi=dpi)
+    _pyplot().close(fig)
+    return path
+
+
+def plot_predicted_vs_actual(oof: pd.DataFrame, path: Path, dpi: int) -> Path:
+    """Scatter OOF prediction against ground truth, one panel per target."""
+    plt = _pyplot()
 
     targets = list(const.TARGETS.values())
     fig, axes = plt.subplots(1, len(targets), figsize=(5.5 * len(targets), 5.0))
@@ -376,19 +668,12 @@ def plot_predicted_vs_actual(oof: pd.DataFrame, path: Path, dpi: int) -> Path:
         ax.set_ylabel(f"out-of-fold predicted {target}")
         ax.set_title(target)
     fig.suptitle("Out-of-fold predictions vs ground truth")
-    fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=dpi)
-    plt.close(fig)
-    return path
+    return _save(fig, path, dpi)
 
 
 def plot_residual_distribution(oof: pd.DataFrame, path: Path, dpi: int) -> Path:
     """Histogram the OOF residuals per target to expose bias and heavy tails."""
-    import matplotlib
-
-    matplotlib.use(const.MATPLOTLIB_BACKEND)
-    import matplotlib.pyplot as plt
+    plt = _pyplot()
 
     targets = list(const.TARGETS.values())
     fig, axes = plt.subplots(1, len(targets), figsize=(5.5 * len(targets), 4.0))
@@ -403,11 +688,7 @@ def plot_residual_distribution(oof: pd.DataFrame, path: Path, dpi: int) -> Path:
         ax.set_ylabel("mutations")
         ax.set_title(f"{target}: mean {residual.mean():+.3f}" if residual.size else target)
     fig.suptitle("Out-of-fold residual distribution")
-    fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=dpi)
-    plt.close(fig)
-    return path
+    return _save(fig, path, dpi)
 
 
 def plot_strategy_comparison(summary: pd.DataFrame, cfg: dict[str, Any], path: Path, dpi: int) -> Path:
@@ -417,10 +698,7 @@ def plot_strategy_comparison(summary: pd.DataFrame, cfg: dict[str, Any], path: P
     right as the split gets stricter are the signature of leakage-driven
     optimism in the random split.
     """
-    import matplotlib
-
-    matplotlib.use(const.MATPLOTLIB_BACKEND)
-    import matplotlib.pyplot as plt
+    plt = _pyplot()
 
     metric = f"{const.POOLED_PREFIX}{cfg['models']['selection_metric']}"
     strategies = [s for s in cfg["validation"]["strategies"] if s in set(summary[const.CV_COL_STRATEGY])]
@@ -447,11 +725,7 @@ def plot_strategy_comparison(summary: pd.DataFrame, cfg: dict[str, Any], path: P
         ax.axhline(0.0, linewidth=0.8, color="black")
     np.atleast_1d(axes)[0].legend(title="CV strategy")
     fig.suptitle(f"{metric} by model and cross-validation strategy")
-    fig.tight_layout()
-    path.parent.mkdir(parents=True, exist_ok=True)
-    fig.savefig(path, dpi=dpi)
-    plt.close(fig)
-    return path
+    return _save(fig, path, dpi)
 
 
 def make_figures(oof: pd.DataFrame, summary: pd.DataFrame, cfg: dict[str, Any]) -> dict[str, Path]:
@@ -470,6 +744,232 @@ def make_figures(oof: pd.DataFrame, summary: pd.DataFrame, cfg: dict[str, Any]) 
     }
     for key, path in written.items():
         logger.info("Wrote %s -> %s", key, path)
+    return written
+
+
+# =============================================================================
+# Figures for the neural network and the model comparison (assignment Task 4)
+# =============================================================================
+def plot_learning_curves(
+    history: pd.DataFrame, fold_summary: pd.DataFrame, path: Path, dpi: int
+) -> Path:
+    """Plot training and inner-validation loss per epoch, one panel per fold.
+
+    This is the figure that shows early stopping actually working: the dashed
+    line marks the epoch whose weights were kept, and it should sit at the
+    minimum of the inner-validation curve, well before the run ends. A fold
+    whose best epoch is its last one never converged and was cut off by
+    ``torch.max_epochs`` instead of by the stopping rule.
+
+    The validation curve here is the **inner** split carved from the training
+    fold, not the out-of-fold rows the metrics are computed on, so it says
+    nothing about reported performance — only about when to stop.
+    """
+    plt = _pyplot()
+
+    folds = sorted(history[const.CV_COL_FOLD].unique())
+    columns = min(const.LEARNING_CURVE_COLUMNS, max(len(folds), 1))
+    rows = -(-len(folds) // columns)  # ceiling division
+    fig, axes = plt.subplots(
+        rows, columns, figsize=(4.6 * columns, 3.4 * rows), squeeze=False, sharex=False
+    )
+    flat = axes.ravel()
+    best_epochs = (
+        fold_summary.set_index(const.CV_COL_FOLD)[const.TORCH_COL_BEST_EPOCH]
+        if const.TORCH_COL_BEST_EPOCH in fold_summary
+        else pd.Series(dtype=float)
+    )
+    for ax, fold in zip(flat, folds, strict=False):
+        curve = history[history[const.CV_COL_FOLD] == fold].sort_values(const.TORCH_COL_EPOCH)
+        epochs = curve[const.TORCH_COL_EPOCH].to_numpy(dtype=float)
+        ax.plot(epochs, curve[const.TORCH_COL_TRAIN_LOSS].to_numpy(dtype=float), label="train")
+        ax.plot(
+            epochs,
+            curve[const.TORCH_COL_VAL_LOSS].to_numpy(dtype=float),
+            label="inner validation",
+        )
+        if fold in best_epochs.index:
+            best = float(best_epochs.loc[fold])
+            ax.axvline(best, linestyle="--", linewidth=1.0, color="grey")
+            ax.set_title(f"fold {fold} (kept epoch {best:.0f})")
+        else:
+            ax.set_title(f"fold {fold}")
+        ax.set_xlabel("epoch")
+        ax.set_ylabel("weighted multitask loss")
+    for ax in flat[len(folds) :]:
+        ax.set_visible(False)
+    flat[0].legend()
+    fig.suptitle("Neural network learning curves (loss per fold)")
+    return _save(fig, path, dpi)
+
+
+def plot_model_comparison(comparison: pd.DataFrame, cfg: dict[str, Any], path: Path, dpi: int) -> Path:
+    """Bar-chart every configured metric for every model, baselines and network alike.
+
+    One panel per target × metric, because the metrics are on incompatible
+    scales — RMSE and MAE are in target units, R² and the two correlations are
+    dimensionless — and putting them on shared axes would misrepresent them.
+    Each panel's title states the direction, since lower is better for the
+    error metrics and higher for the rest.
+    """
+    plt = _pyplot()
+
+    metrics = configured_metrics(cfg)
+    targets = [t for t in const.TARGETS.values() if t in set(comparison[const.COL_TARGET])]
+    models = list(dict.fromkeys(comparison[const.COL_MODEL]))
+    fig, axes = plt.subplots(
+        len(targets),
+        len(metrics),
+        figsize=(3.1 * len(metrics), 3.4 * len(targets)),
+        squeeze=False,
+    )
+    for row, target in enumerate(targets):
+        rows = comparison[comparison[const.COL_TARGET] == target].set_index(const.COL_MODEL)
+        for column, metric in enumerate(metrics):
+            ax = axes[row][column]
+            name = f"{const.POOLED_PREFIX}{metric.value}"
+            heights = [
+                float(rows.loc[model, name]) if model in rows.index else float("nan")
+                for model in models
+            ]
+            # The network is the subject of the comparison, so it is the one bar
+            # that is filled differently; everything else is a reference point.
+            colors = ["tab:orange" if m == const.TORCH_MODEL_NAME else "tab:blue" for m in models]
+            ax.bar(np.arange(len(models)), heights, color=colors)
+            ax.set_xticks(np.arange(len(models)))
+            ax.set_xticklabels(models, rotation=const.FIGURE_XTICK_ROTATION, ha="right")
+            direction = "higher is better" if const.METRIC_GREATER_IS_BETTER[metric] else "lower is better"
+            ax.set_title(f"{metric.value} ({direction})", fontsize=9)
+            ax.axhline(0.0, linewidth=0.8, color="black")
+            if column == 0:
+                ax.set_ylabel(target)
+    strategy = comparison[const.CV_COL_STRATEGY].iloc[0] if not comparison.empty else "n/a"
+    fig.suptitle(f"Pooled out-of-fold metrics by model ({strategy} cross-validation)")
+    return _save(fig, path, dpi)
+
+
+def plot_baseline_vs_torch(
+    baseline_oof: pd.DataFrame,
+    torch_oof: pd.DataFrame,
+    path: Path,
+    dpi: int,
+    model_label: str = const.TORCH_MODEL_NAME,
+) -> Path:
+    """Overlay the selected baseline and the network on the same out-of-fold rows.
+
+    Top row is predicted against observed with the identity line; bottom row is
+    the residual distribution. Two models trained on identical folds predict the
+    same rows, so these panels are directly comparable: a model that tracks the
+    identity line but spreads wider is worse at the same job, whereas one whose
+    residual histogram is shifted off zero is biased rather than merely noisy.
+    """
+    plt = _pyplot()
+
+    targets = list(const.TARGETS.values())
+    fig, axes = plt.subplots(2, len(targets), figsize=(5.4 * len(targets), 8.0), squeeze=False)
+    series = [("best baseline", baseline_oof), (model_label, torch_oof)]
+    for column, target in enumerate(targets):
+        scatter_ax, hist_ax = axes[0][column], axes[1][column]
+        bounds: list[float] = []
+        for label, frame in series:
+            group = frame[frame[const.COL_TARGET] == target]
+            if group.empty:
+                continue
+            y_true = group[const.COL_Y_TRUE].to_numpy(dtype=float)
+            y_pred = group[const.COL_Y_PRED].to_numpy(dtype=float)
+            name = (
+                f"{label} ({group[const.COL_MODEL].iloc[0]})"
+                if label == "best baseline"
+                else label
+            )
+            scatter_ax.scatter(
+                y_true, y_pred, s=14, alpha=const.FIGURE_SCATTER_ALPHA, edgecolor="none", label=name
+            )
+            hist_ax.hist(
+                y_pred - y_true,
+                bins=const.RESIDUAL_HIST_BINS,
+                alpha=const.FIGURE_OVERLAY_ALPHA,
+                label=f"{name}: mean {float((y_pred - y_true).mean()):+.3f}",
+            )
+            bounds += [float(y_true.min()), float(y_true.max()), float(y_pred.min()), float(y_pred.max())]
+        if bounds:
+            limits = [min(bounds), max(bounds)]
+            scatter_ax.plot(limits, limits, linestyle="--", linewidth=1.0, color="grey")
+        scatter_ax.set_xlabel(f"observed {target}")
+        scatter_ax.set_ylabel(f"out-of-fold predicted {target}")
+        scatter_ax.set_title(target)
+        scatter_ax.legend(fontsize=8)
+        hist_ax.axvline(0.0, linestyle="--", linewidth=1.0, color="grey")
+        hist_ax.set_xlabel(f"predicted - observed ({target})")
+        hist_ax.set_ylabel("mutations")
+        hist_ax.legend(fontsize=8)
+    fig.suptitle("Selected baseline vs. multitask network on identical out-of-fold rows")
+    return _save(fig, path, dpi)
+
+
+def make_torch_figures(
+    torch_oof: pd.DataFrame,
+    history: pd.DataFrame,
+    fold_summary: pd.DataFrame,
+    comparison: pd.DataFrame,
+    cfg: dict[str, Any],
+    figure_keys: tuple[str, ...] = const.TORCH_FIGURE_FILE_KEYS,
+    model_label: str = const.TORCH_MODEL_NAME,
+) -> dict[str, Path]:
+    """Write the Task 4 figures; returns the written paths (empty if disabled).
+
+    The baseline overlay is skipped rather than fabricated when the training
+    stage has not been run, so a network run on its own still produces the two
+    figures that depend only on its own artifacts.
+
+    Args:
+        torch_oof: The network's out-of-fold predictions.
+        history: Per-epoch losses.
+        fold_summary: Per-fold early-stopping record.
+        comparison: The network beside the other models.
+        cfg: Loaded configuration.
+        figure_keys: The three config ``files`` keys to write, in the order
+            learning curves, model comparison, baseline overlay. Each network
+            architecture passes its own so they do not overwrite each other.
+        model_label: Name for the network in the overlay legend.
+
+    Raises:
+        ValueError: If ``figure_keys`` does not hold exactly three keys.
+    """
+    if len(figure_keys) != len(const.TORCH_FIGURE_FILE_KEYS):
+        raise ValueError(
+            f"figure_keys must hold {len(const.TORCH_FIGURE_FILE_KEYS)} keys "
+            f"(learning curves, comparison, overlay), got {figure_keys}"
+        )
+    if not cfg["evaluation"]["figures"]:
+        logger.info("evaluation.figures is false: skipping neural-network figures")
+        return {}
+    dpi = cfg["evaluation"]["figure_dpi"]
+    curves_key, comparison_key, overlay_key = figure_keys
+    paths = _figure_paths(cfg, figure_keys)
+    written: dict[str, Path] = {}
+    if not history.empty:
+        written[curves_key] = plot_learning_curves(
+            history, fold_summary, paths[curves_key], dpi
+        )
+    if not comparison.empty:
+        written[comparison_key] = plot_model_comparison(
+            comparison, cfg, paths[comparison_key], dpi
+        )
+    try:
+        oof, _, selection = load_evaluation_inputs(cfg)
+    except FileNotFoundError:
+        logger.warning("Baseline artifacts missing: skipping the baseline-vs-network figure")
+    else:
+        baseline = selected_oof(oof, selection, evaluation_strategy(cfg))
+        if baseline.empty:
+            logger.warning("No baseline OOF rows to compare against: skipping the overlay figure")
+        else:
+            written[overlay_key] = plot_baseline_vs_torch(
+                baseline, torch_oof, paths[overlay_key], dpi, model_label=model_label
+            )
+    for key, figure in written.items():
+        logger.info("Wrote %s -> %s", key, figure)
     return written
 
 
@@ -520,24 +1020,38 @@ def to_markdown(
 
 
 def export_artifacts(
-    markdown: str, benchmark: pd.DataFrame, cfg: dict[str, Any]
+    markdown: str,
+    benchmark: pd.DataFrame,
+    comparison: pd.DataFrame,
+    record: dict[str, Any],
+    cfg: dict[str, Any],
 ) -> dict[str, Path]:
-    """Write the evaluation summary and the baseline benchmark table.
+    """Write the evaluation summary, the baseline benchmark and the Task 5 comparison.
 
     Returns:
         Mapping of artifact name to written path.
     """
     paths = {
         key: resolve_path(cfg, "metrics_dir", key)
-        for key in ("evaluation_markdown", "baseline_benchmark", "baseline_benchmark_markdown")
+        for key in (
+            "evaluation_markdown",
+            "evaluation_json",
+            "baseline_benchmark",
+            "baseline_benchmark_markdown",
+            "model_comparison",
+        )
     }
     for path in paths.values():
         path.parent.mkdir(parents=True, exist_ok=True)
     paths["evaluation_markdown"].write_text(markdown, encoding=const.CONFIG_ENCODING)
+    paths["evaluation_json"].write_text(
+        json.dumps(record, indent=2, default=str), encoding=const.CONFIG_ENCODING
+    )
     write_table(benchmark, paths["baseline_benchmark"])
     paths["baseline_benchmark_markdown"].write_text(
         benchmark_to_markdown(benchmark, cfg), encoding=const.CONFIG_ENCODING
     )
+    write_table(comparison, paths["model_comparison"])
     for key, path in paths.items():
         logger.info("Wrote %s -> %s", key, path)
     return paths
@@ -560,11 +1074,26 @@ def run_evaluation(cfg: dict[str, Any]) -> pd.DataFrame:
     gaps = log_optimism_gap(summary, cfg)
     benchmark = benchmark_table(summary, cfg)
     figures = make_figures(focus, summary, cfg)
-    export_artifacts(to_markdown(headline, summary, gaps, figures, cfg), benchmark, cfg)
+
+    # Task 5: the same metrics reorganised across both comparative axes, with
+    # the neural network folded in when it has been trained.
+    combined = unified_summary(cfg)
+    comparison = model_comparison_table(combined, cfg)
+    leaderboard = family_leaderboard(comparison, cfg)
+    notes = interpretation_notes(comparison, cfg)
+    for note in notes:
+        logger.info("%s", note)
+    markdown = to_markdown(headline, summary, gaps, figures, cfg) + "\n" + comparison_to_markdown(
+        comparison, leaderboard, notes, cfg
+    )
+    record = evaluation_record(headline, comparison, leaderboard, gaps, notes, figures, cfg)
+
+    export_artifacts(markdown, benchmark, comparison, record, cfg)
     logger.info(
-        "Evaluation complete: %d target rows, %d benchmark rows, %d figures",
+        "Evaluation complete: %d target rows, %d benchmark rows, %d comparison rows, %d figures",
         len(headline),
         len(benchmark),
+        len(comparison),
         len(figures),
     )
     return headline

@@ -35,6 +35,8 @@ TEST_TOP_K: int = 4
 TEST_N_CANDIDATES: int = 2  # candidates written up by the interpretation stage
 TEST_MAX_EPOCHS: int = 3    # the end-to-end test checks wiring, not convergence
 TEST_PATIENCE: int = 2
+TEST_BOTTLENECK_DIM: int = 4
+TEST_FUSION_DIM: int = 8
 
 
 # =============================================================================
@@ -69,6 +71,15 @@ def pipeline_cfg(cfg: dict[str, Any], raw_files: dict[str, Path]) -> dict[str, A
     cfg["torch"]["batch_size"] = 8
     cfg["torch"]["max_epochs"] = TEST_MAX_EPOCHS
     cfg["torch"]["early_stopping"]["patience"] = TEST_PATIENCE
+    cfg["torch_v2"]["tabular_branch"]["hidden_dims"] = [8]
+    cfg["torch_v2"]["embedding_branch"]["hidden_dims"] = [8]
+    cfg["torch_v2"]["embedding_branch"]["bottleneck_dim"] = TEST_BOTTLENECK_DIM
+    cfg["torch_v2"]["fusion"]["hidden_dim"] = TEST_FUSION_DIM
+    cfg["torch_v2"]["fusion"]["n_residual_blocks"] = 1
+    cfg["torch_v2"]["head_hidden_dim"] = None
+    cfg["torch_v2"]["batch_size"] = 8
+    cfg["torch_v2"]["max_epochs"] = TEST_MAX_EPOCHS
+    cfg["torch_v2"]["early_stopping"]["patience"] = TEST_PATIENCE
     validate_config(cfg)
     return cfg
 
@@ -87,8 +98,9 @@ def test_stage_registry_is_in_dependency_order() -> None:
         "data_processing",
         "validation",
         "train",
-        "evaluate",
         "train_torch",
+        "train_torch_v2",
+        "evaluate",
         "predict",
         "ablation",
         "interpret",
@@ -108,7 +120,7 @@ def test_requested_stages_are_reordered_canonically() -> None:
 def test_from_runs_the_stage_and_everything_after() -> None:
     """``--from`` resumes a pipeline without redoing the stages that have not changed."""
     assert main.resolve_stages(None, "evaluate") == [
-        "evaluate", "train_torch", "predict", "ablation", "interpret",
+        "evaluate", "predict", "ablation", "interpret",
     ]
 
 
@@ -184,6 +196,8 @@ def test_full_pipeline_produces_every_deliverable(pipeline_cfg: dict[str, Any]) 
             "cv_metrics_summary",
             "model_selection",
             "evaluation_markdown",
+            "evaluation_json",
+            "model_comparison",
             "ablation_study",
             "ablation_markdown",
             "torch_cv_metrics",
@@ -191,9 +205,18 @@ def test_full_pipeline_produces_every_deliverable(pipeline_cfg: dict[str, Any]) 
             "torch_fold_summary",
             "torch_comparison",
             "torch_comparison_markdown",
+            "torch_v2_cv_metrics",
+            "torch_v2_history",
+            "torch_v2_fold_summary",
+            "torch_v2_comparison",
+            "torch_v2_comparison_markdown",
         ],
         "models_dir": ["training_metadata"],
-        "figures_dir": list(const.FIGURE_FILE_KEYS),
+        "figures_dir": [
+            *const.FIGURE_FILE_KEYS,
+            *const.TORCH_FIGURE_FILE_KEYS,
+            *const.TORCH_V2_FIGURE_FILE_KEYS,
+        ],
         "rankings_dir": [
             "all_predictions",
             "top_candidates",

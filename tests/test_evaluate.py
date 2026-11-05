@@ -30,7 +30,7 @@ from src import evaluate as ev
 from src import train as tr
 from src.common import constants as const
 from src.common.config import validate_config
-from src.common.io import read_table
+from src.common.io import read_table, write_table
 
 # The synthetic data has a single labeled protein in one family, so a family-grouped
 # training fold can hold one embedding vector; PCA then has zero variance and numpy
@@ -39,6 +39,9 @@ pytestmark = pytest.mark.filterwarnings("ignore:invalid value encountered in div
 
 TEST_N_SPLITS: int = 2  # synthetic data has only 2 families
 TEST_N_COMPONENTS: int = 3  # must not exceed the smallest training fold
+# Shifts the stand-in network predictions off the baseline's so the overlay
+# figure has two visibly distinct series to draw.
+TEST_PREDICTION_OFFSET: float = 0.1
 
 
 # =============================================================================
@@ -469,3 +472,308 @@ def test_run_evaluation_writes_the_benchmark_artifacts(trained_cfg: dict[str, An
     written = read_table(csv_path)
     assert not written.empty
     assert f"{const.POOLED_PREFIX}{const.Metric.PEARSON.value}" in written.columns
+
+
+# =============================================================================
+# Neural-network and comparison figures (assignment Task 4)
+# =============================================================================
+@pytest.fixture()
+def torch_frames(trained_cfg: dict[str, Any]) -> dict[str, pd.DataFrame]:
+    """Minimal stand-ins for the artifacts ``src.train_torch`` writes.
+
+    Built by hand rather than by training a network: these tests are about the
+    plotting code, and a real fit would make them slow and non-deterministic
+    for no extra coverage.
+    """
+    strategy = ev.evaluation_strategy(trained_cfg)
+    oof, _, selection = ev.load_evaluation_inputs(trained_cfg)
+    baseline = ev.selected_oof(oof, selection, strategy)
+    network = baseline.copy()
+    network[const.COL_MODEL] = const.TORCH_MODEL_NAME
+    network[const.COL_Y_PRED] = network[const.COL_Y_PRED] + TEST_PREDICTION_OFFSET
+
+    history = pd.DataFrame(
+        {
+            const.CV_COL_STRATEGY: strategy,
+            const.CV_COL_FOLD: [0, 0, 0, 1, 1, 1],
+            const.TORCH_COL_EPOCH: [1, 2, 3, 1, 2, 3],
+            const.TORCH_COL_TRAIN_LOSS: [0.9, 0.6, 0.4, 0.8, 0.5, 0.3],
+            const.TORCH_COL_VAL_LOSS: [1.0, 0.7, 0.8, 0.9, 0.6, 0.7],
+        }
+    )
+    fold_summary = pd.DataFrame(
+        {
+            const.CV_COL_STRATEGY: [strategy, strategy],
+            const.CV_COL_FOLD: [0, 1],
+            const.TORCH_COL_BEST_EPOCH: [2, 2],
+            const.TORCH_COL_STOPPED_EPOCH: [3, 3],
+        }
+    )
+    metrics = ev.configured_metrics(trained_cfg)
+    comparison = pd.DataFrame(
+        [
+            {
+                const.COL_TARGET: target,
+                const.COL_MODEL: model,
+                const.CV_COL_STRATEGY: strategy,
+                **{f"{const.POOLED_PREFIX}{m.value}": 0.5 for m in metrics},
+            }
+            for target in const.TARGETS.values()
+            for model in (const.ModelName.RIDGE.value, const.TORCH_MODEL_NAME)
+        ]
+    )
+    return {
+        "oof": network,
+        "history": history,
+        "fold_summary": fold_summary,
+        "comparison": comparison,
+    }
+
+
+def test_make_torch_figures_writes_every_configured_figure(
+    trained_cfg: dict[str, Any], torch_frames: dict[str, pd.DataFrame]
+) -> None:
+    """All three Task 4 figures land in ``figures_dir`` under their configured names."""
+    written = ev.make_torch_figures(
+        torch_frames["oof"],
+        torch_frames["history"],
+        torch_frames["fold_summary"],
+        torch_frames["comparison"],
+        trained_cfg,
+    )
+
+    assert set(written) == set(const.TORCH_FIGURE_FILE_KEYS)
+    for key, path in written.items():
+        assert path == Path(trained_cfg["paths"]["figures_dir"], trained_cfg["files"][key])
+        assert path.is_file() and path.stat().st_size > 0
+
+
+def test_torch_figures_honour_the_figures_switch(
+    trained_cfg: dict[str, Any], torch_frames: dict[str, pd.DataFrame]
+) -> None:
+    """``evaluation.figures: false`` suppresses the Task 4 figures too, not just Task 3's."""
+    trained_cfg["evaluation"]["figures"] = False
+
+    written = ev.make_torch_figures(
+        torch_frames["oof"],
+        torch_frames["history"],
+        torch_frames["fold_summary"],
+        torch_frames["comparison"],
+        trained_cfg,
+    )
+
+    assert written == {}
+    figures = Path(trained_cfg["paths"]["figures_dir"])
+    assert not any((figures / trained_cfg["files"][k]).exists() for k in const.TORCH_FIGURE_FILE_KEYS)
+
+
+def test_torch_figures_skip_the_overlay_without_baselines(
+    trained_cfg: dict[str, Any], torch_frames: dict[str, pd.DataFrame]
+) -> None:
+    """A Task 4 run before Task 3 still draws what it can instead of failing.
+
+    The comparison figure needs the baseline metrics and the overlay needs the
+    baseline predictions; neither is invented when they are absent.
+    """
+    Path(trained_cfg["paths"]["metrics_dir"], trained_cfg["files"]["model_selection"]).unlink()
+
+    written = ev.make_torch_figures(
+        torch_frames["oof"],
+        torch_frames["history"],
+        torch_frames["fold_summary"],
+        pd.DataFrame(),
+        trained_cfg,
+    )
+
+    assert set(written) == {"fig_torch_learning_curves"}
+
+
+def test_learning_curves_draw_one_panel_per_fold(
+    trained_cfg: dict[str, Any], torch_frames: dict[str, pd.DataFrame]
+) -> None:
+    """Every fold in the history gets a panel, and the kept epoch is annotated."""
+    path = Path(trained_cfg["paths"]["figures_dir"], trained_cfg["files"]["fig_torch_learning_curves"])
+
+    written = ev.plot_learning_curves(torch_frames["history"], torch_frames["fold_summary"], path, 60)
+
+    assert written == path and path.is_file()
+
+
+def test_learning_curves_tolerate_a_missing_fold_summary(
+    trained_cfg: dict[str, Any], torch_frames: dict[str, pd.DataFrame]
+) -> None:
+    """Without the early-stopping record the curves still plot, just unannotated."""
+    path = Path(trained_cfg["paths"]["figures_dir"], trained_cfg["files"]["fig_torch_learning_curves"])
+
+    written = ev.plot_learning_curves(torch_frames["history"], pd.DataFrame(), path, 60)
+
+    assert written.is_file() and written.stat().st_size > 0
+
+
+# =============================================================================
+# Comparative analysis across families and strategies (assignment Task 5)
+# =============================================================================
+def write_torch_metrics(cfg: dict[str, Any], strategy: str) -> pd.DataFrame:
+    """Write a stand-in ``torch_cv_metrics.csv`` so the network joins the comparison."""
+    metrics = ev.configured_metrics(cfg)
+    network = pd.DataFrame(
+        [
+            {
+                const.CV_COL_STRATEGY: strategy,
+                const.COL_MODEL: const.TORCH_MODEL_NAME,
+                const.COL_TARGET: target,
+                const.COL_N_SAMPLES: 10,
+                **{f"{const.POOLED_PREFIX}{m.value}": 0.4 for m in metrics},
+                **{f"{const.FOLD_STD_PREFIX}{m.value}": 0.01 for m in metrics},
+            }
+            for target in const.TARGETS.values()
+        ]
+    )
+    write_table(network, Path(cfg["paths"]["metrics_dir"], cfg["files"]["torch_cv_metrics"]))
+    return network
+
+
+def test_unified_summary_without_the_network_is_the_baselines(trained_cfg: dict[str, Any]) -> None:
+    """Task 5 runs before Task 4 has ever been executed without inventing rows."""
+    combined = ev.unified_summary(trained_cfg)
+
+    baselines = read_table(
+        Path(trained_cfg["paths"]["metrics_dir"], trained_cfg["files"]["cv_metrics_summary"])
+    )
+    assert len(combined) == len(baselines)
+    assert const.TORCH_MODEL_NAME not in set(combined[const.COL_MODEL])
+
+
+def test_unified_summary_folds_in_the_network(trained_cfg: dict[str, Any]) -> None:
+    """When the network's metrics exist they are stacked onto the baselines."""
+    write_torch_metrics(trained_cfg, ev.evaluation_strategy(trained_cfg))
+
+    combined = ev.unified_summary(trained_cfg)
+
+    assert const.TORCH_MODEL_NAME in set(combined[const.COL_MODEL])
+
+
+def test_model_comparison_covers_both_axes(multi_model_cfg: dict[str, Any]) -> None:
+    """One row per model x target x strategy, each tagged with its estimator family."""
+    strategy = ev.evaluation_strategy(multi_model_cfg)
+    write_torch_metrics(multi_model_cfg, strategy)
+    combined = ev.unified_summary(multi_model_cfg)
+
+    comparison = ev.model_comparison_table(combined, multi_model_cfg)
+
+    strategies = set(comparison[const.CV_COL_STRATEGY])
+    assert len(strategies) > 1, "the strategy axis needs more than one strategy to compare"
+    assert set(comparison[const.COL_MODEL]) == {
+        *multi_model_cfg["models"]["candidates"],
+        const.TORCH_MODEL_NAME,
+    }
+    # Families, not names: the three baselines must not collapse into one label.
+    assert len(set(comparison[const.EVAL_COL_MODEL_FAMILY])) == 4
+    for metric in ev.configured_metrics(multi_model_cfg):
+        assert f"{const.POOLED_PREFIX}{metric.value}" in comparison.columns
+        assert f"{const.EVAL_OPTIMISM_GAP_PREFIX}{metric.value}" in comparison.columns
+
+
+def test_optimism_gap_is_random_minus_this_row_for_every_metric(
+    multi_model_cfg: dict[str, Any],
+) -> None:
+    """The per-metric gap is computed against that model's own random-split score."""
+    combined = ev.unified_summary(multi_model_cfg)
+    comparison = ev.model_comparison_table(combined, multi_model_cfg)
+    random_ = const.SplitStrategy.RANDOM.value
+    indexed = comparison.set_index([const.COL_TARGET, const.COL_MODEL, const.CV_COL_STRATEGY])
+
+    for (target, model, strategy), row in indexed.iterrows():
+        for metric in ev.configured_metrics(multi_model_cfg):
+            pooled = f"{const.POOLED_PREFIX}{metric.value}"
+            gap = row[f"{const.EVAL_OPTIMISM_GAP_PREFIX}{metric.value}"]
+            if strategy == random_:
+                assert np.isnan(gap), "a random-split row has nothing to be optimistic against"
+            else:
+                expected = indexed.loc[(target, model, random_), pooled] - row[pooled]
+                assert gap == pytest.approx(expected)
+
+
+def test_family_leaderboard_ranks_within_a_target(multi_model_cfg: dict[str, Any]) -> None:
+    """Ranking is per target, best first, and only on the reported strategy."""
+    combined = ev.unified_summary(multi_model_cfg)
+    comparison = ev.model_comparison_table(combined, multi_model_cfg)
+
+    leaderboard = ev.family_leaderboard(comparison, multi_model_cfg)
+
+    strategy = ev.evaluation_strategy(multi_model_cfg)
+    column = f"{const.POOLED_PREFIX}{multi_model_cfg['models']['selection_metric']}"
+    assert set(leaderboard[const.CV_COL_STRATEGY]) == {strategy}
+    for target in const.TARGETS.values():
+        rows = leaderboard[leaderboard[const.COL_TARGET] == target]
+        assert list(rows["rank"]) == list(range(1, len(rows) + 1))
+        scores = rows[column].to_numpy(dtype=float)
+        assert np.all(np.diff(scores) <= 0), "spearman is higher-is-better, so rank 1 scores most"
+
+
+def test_interpretation_notes_quote_the_measured_numbers(multi_model_cfg: dict[str, Any]) -> None:
+    """The commentary is generated from this run, not fixed prose."""
+    combined = ev.unified_summary(multi_model_cfg)
+    comparison = ev.model_comparison_table(combined, multi_model_cfg)
+
+    notes = ev.interpretation_notes(comparison, multi_model_cfg)
+
+    text = "\n".join(notes)
+    assert "optimism" in text.lower() or "random split" in text
+    assert "Pearson" in text and "Spearman" in text
+    strategy = ev.evaluation_strategy(multi_model_cfg)
+    reported = comparison[comparison[const.CV_COL_STRATEGY] == strategy]
+    gap_column = f"{const.EVAL_OPTIMISM_GAP_PREFIX}{multi_model_cfg['models']['selection_metric']}"
+    worst = reported.loc[reported[gap_column].idxmax()]
+    assert f"{float(worst[gap_column]):+.3f}" in text
+    assert str(worst[const.COL_MODEL]) in text
+
+
+def test_interpretation_notes_survive_a_single_strategy(trained_cfg: dict[str, Any]) -> None:
+    """With no random split to compare against, the gap note is omitted, not faked."""
+    trained_cfg["validation"]["strategies"] = [trained_cfg["validation"]["primary_strategy"]]
+    combined = ev.unified_summary(trained_cfg)
+    comparison = ev.model_comparison_table(combined, trained_cfg)
+
+    notes = ev.interpretation_notes(comparison, trained_cfg)
+
+    assert not any("optimism" in note.lower() for note in notes)
+    assert any("Spearman" in note for note in notes)
+
+
+def test_run_evaluation_writes_the_comparison_artifacts(trained_cfg: dict[str, Any]) -> None:
+    """Task 5 emits the comparison table as CSV and the summary as JSON."""
+    write_torch_metrics(trained_cfg, ev.evaluation_strategy(trained_cfg))
+
+    ev.run_evaluation(trained_cfg)
+
+    metrics_dir = Path(trained_cfg["paths"]["metrics_dir"])
+    comparison = read_table(metrics_dir / trained_cfg["files"]["model_comparison"])
+    assert const.EVAL_COL_MODEL_FAMILY in comparison.columns
+    assert const.TORCH_MODEL_NAME in set(comparison[const.COL_MODEL])
+
+    record = json.loads(
+        (metrics_dir / trained_cfg["files"]["evaluation_json"]).read_text(
+            encoding=const.CONFIG_ENCODING
+        )
+    )
+    assert record["random_seed"] == trained_cfg["project"]["random_seed"]
+    assert record["reported_strategy"] == ev.evaluation_strategy(trained_cfg)
+    assert record["targets"] == list(const.TARGETS.values())
+    assert len(record["model_comparison"]) == len(comparison)
+    assert record["interpretation"]
+    assert record["model_families"][const.TORCH_MODEL_NAME] == const.MODEL_FAMILY_NEURAL
+
+
+def test_evaluation_markdown_carries_the_comparative_section(trained_cfg: dict[str, Any]) -> None:
+    """The human-readable report gains the Task 5 analysis without losing Task 3's."""
+    ev.run_evaluation(trained_cfg)
+
+    text = Path(
+        trained_cfg["paths"]["metrics_dir"], trained_cfg["files"]["evaluation_markdown"]
+    ).read_text(encoding=const.CONFIG_ENCODING)
+
+    assert "# Evaluation summary" in text
+    assert "# Comparative evaluation" in text
+    assert "## Interpretation" in text
+    assert const.EVAL_OPTIMISM_GAP_PREFIX in text
