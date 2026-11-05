@@ -57,10 +57,37 @@ python -c "import sys, sklearn, numpy; print(sys.version.split()[0], sklearn.__v
 
 ## How to run
 
-The whole pipeline, end to end:
+Everything, end to end — this covers every assignment task except the EDA notebook:
 
 ```bash
 python main.py --config config/config.yaml
+```
+
+Measured 126 s on an M-series Mac with the Homebrew/PyPI BLAS: `train` 34 s
+(90 pipelines), `ablation` 32 s (70 refits), `train_torch_v2` 42 s, everything
+else under 11 s. Nothing is cached between runs, so a re-run costs the same and
+produces the same numbers.
+
+### Assignment tasks, and the command for each
+
+| # | Task | Command | Primary output |
+|---|------|---------|----------------|
+| 1 | Exploratory data analysis | `jupyter lab notebooks/exploratory_analysis.ipynb` | the notebook itself (outputs committed) |
+| 2 | Preprocessing & feature engineering | `python -m src.data_processing --config config/config.yaml` | `data/processed/` |
+| 3 | Baseline models & benchmark | `python -m src.train --config config/config.yaml` | `results/metrics/baseline_benchmark.md` |
+| 4 | Neural networks | `python -m src.train_torch --config config/config.yaml`<br>`python -m src.train_torch_v2 --config config/config.yaml` | `results/metrics/torch_vs_baselines.md`<br>`results/metrics/torch_v2_vs_baselines.md` |
+| 5 | Evaluation & comparative analysis | `python -m src.evaluate --config config/config.yaml` | `results/metrics/model_comparison.csv`, `evaluation_summary.{md,json}` |
+| 6 | Ablation study | `python -m src.ablation --config config/config.yaml` | `results/metrics/ablation_summary.md`, `results/figures/ablation_performance_drop.png` |
+| 7 | Model interpretation & attribution | `python -m src.attribution --config config/config.yaml` | `results/metrics/feature_importances.csv`, `results/figures/feature_importance.png` |
+| 8 | Candidate prioritization | `python -m src.predict --config config/config.yaml` | `results/mutation_rankings/top_10_candidates.{csv,md}` |
+| 9 | Per-candidate interpretation | `python -m src.interpret --config config/config.yaml` | `results/mutation_rankings/candidate_interpretation.md` |
+
+Stages depend on the artifacts of the stages above them, so run them in that
+order or just use `python main.py`. Re-executing the EDA notebook headless:
+
+```bash
+python -m jupyter nbconvert --to notebook --execute --inplace \
+    notebooks/exploratory_analysis.ipynb
 ```
 
 Selected stages, always executed in dependency order:
@@ -71,24 +98,16 @@ python main.py --stages train evaluate
 python main.py --from evaluate        # this stage and everything after it
 ```
 
-Every stage is also runnable on its own, which is useful when iterating on one of them:
+The ten stages, in dependency order, are:
 
-```bash
-python -m src.data_processing --config config/config.yaml   # merge, clean, engineer features
-python -m src.validation      --config config/config.yaml   # CV fold report and leakage audit
-python -m src.train           --config config/config.yaml   # train, select, save models
-python -m src.train_torch     --config config/config.yaml   # multitask NN, benchmarked vs baselines
-python -m src.train_torch_v2  --config config/config.yaml   # dual-branch NN, same folds
-python -m src.evaluate        --config config/config.yaml   # metrics, comparison, figures
-python -m src.predict         --config config/config.yaml   # score candidates, Top 10
-python -m src.ablation        --config config/config.yaml   # feature-subset ablation
-python -m src.attribution     --config config/config.yaml   # permutation + impurity importance
-python -m src.interpret       --config config/config.yaml   # per-candidate write-up
+```text
+data_processing -> validation -> train -> train_torch -> train_torch_v2
+                -> evaluate -> predict -> ablation -> attribution -> interpret
 ```
 
-Training fits 90 pipelines. Runtime depends heavily on the BLAS behind numpy: roughly
-1 minute with Anaconda's MKL build, but around 15 minutes with the default
-Homebrew/PyPI build.
+`validation` has no assignment task of its own: it writes the CV fold report and
+the leakage audit that every later stage relies on
+(`python -m src.validation --config config/config.yaml`).
 
 Checks:
 
@@ -100,10 +119,15 @@ python -m mypy src main.py
 
 ## HTTP API
 
-The trained model is also callable over HTTP, for Postman, curl or any client:
+The trained model is also callable over HTTP, for Postman, curl or any client.
+This needs three dependencies the batch pipeline does not, so `src/api.py` is
+the one module that will not import until they are installed — and
+`tests/test_api.py` skips rather than fails in that state:
 
 ```bash
-pip install -r requirements.txt          # adds fastapi, uvicorn, pydantic
+pip install fastapi==0.162.0 uvicorn==0.54.0 pydantic==2.14.2 httpx==0.28.1
+# (all four are already pinned in requirements.txt / requirements-dev.txt)
+
 python -m src.api --config config/config.yaml
 ```
 
@@ -244,8 +268,9 @@ src/predict.py                  Ensemble inference, uncertainty, viability gate,
 src/ablation.py                 Feature-subset ablation study and attribution figure
 src/attribution.py              Permutation and impurity feature importance (Task 7)
 src/interpret.py                Per-candidate scientific interpretation
+tests/                          Mirrors src/, one test module per source module
 results/metrics/                CV metrics, OOF predictions, baseline benchmark, model
-                                comparison (CSV + JSON), ablation
+                                comparison (CSV + JSON), ablation, feature importances
 results/figures/                Fit and residual plots, strategy comparison, learning
                                 curves, baseline-vs-network comparison
 results/mutation_rankings/      Scored candidates, Top 10, candidate interpretation
@@ -256,7 +281,13 @@ report/final_report_full.md     Extended version: full derivations, all candidat
 tests/                          786 tests, mirroring src/
 main.py                         End-to-end orchestration
 docs/CODING_GUIDELINES.md       Standards every change must follow
+docs/api/example_request.json   Ready-to-paste request body for Postman / curl
 ```
+
+Every path, hyperparameter, threshold and seed above lives in
+`config/config.yaml`; no run-affecting value is written into a module. Changing
+which models are fitted, which CV strategies run, the viability thresholds or
+the Top-K size is a config edit, not a code edit.
 
 Contributors: read [docs/CODING_GUIDELINES.md](docs/CODING_GUIDELINES.md) first. Section 4
 defines what goes in `config.yaml` versus `src/common/constants.py`.
