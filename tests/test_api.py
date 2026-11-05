@@ -35,7 +35,7 @@ from src.common.config import validate_config
 # batch pipeline is installable without the web dependencies, and this suite
 # must skip rather than error in that configuration.
 pytest.importorskip("fastapi", reason="src.api needs fastapi; see requirements.txt")
-pytest.importorskip("httpx", reason="fastapi.testclient needs httpx; see requirements-dev.txt")
+pytest.importorskip("httpx", reason="fastapi.testclient needs httpx; see requirements.txt")
 
 from fastapi.testclient import TestClient  # noqa: E402
 

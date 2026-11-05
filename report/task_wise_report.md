@@ -22,7 +22,7 @@ artifacts in this report were produced by a single clean run at seed
 ```bash
 cd medvolt_protein_engineering
 python -m venv .venv && source .venv/bin/activate
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 python -c "import sys, sklearn, numpy; print(sys.version.split()[0], sklearn.__version__, numpy.__version__)"
 # expected: 3.11.x 1.9.1 2.4.6
 ```

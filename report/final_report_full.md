@@ -252,5 +252,5 @@ already the right shape — the embedding branch is swapped for a structural enc
 
 ## Appendix: reproducing these results
 
-After `pip install -r requirements-dev.txt`, `python main.py --config config/config.yaml` reproduces every number above in ~126 s (807 tests pass via `python -m pytest -q`). Ten stages run in dependency order — `data_processing → validation → train → train_torch → train_torch_v2 →
+After `pip install -r requirements.txt`, `python main.py --config config/config.yaml` reproduces every number above in ~126 s (807 tests pass via `python -m pytest -q`). Ten stages run in dependency order — `data_processing → validation → train → train_torch → train_torch_v2 →
 evaluate → predict → ablation → attribution → interpret` — each also runnable alone as `python -m src.<stage>`. A per-task walkthrough, with the command and outputs for each, is in `report/task_wise_report.md`. Requires Python ≥ 3.11; all configuration lives in `config/config.yaml`.

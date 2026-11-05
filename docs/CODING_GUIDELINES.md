@@ -156,8 +156,8 @@ Rules:
 - A single seed from `config.project.random_seed` is passed explicitly to every
   stochastic component (`random_state=`, `np.random.default_rng(seed)`). Global
   `np.random.seed()` is not allowed.
-- Runtime dependencies are pinned exactly in `requirements.txt`; tooling in
-  `requirements-dev.txt`. Dependency upgrades are their own reviewed change.
+- Runtime dependencies and tooling are pinned exactly in `requirements.txt`.
+  Dependency upgrades are their own reviewed change.
 - Columnar outputs prefer Parquet (types preserved, deterministic). CSV is for
   human-facing reports.
 - Model artifacts are saved together with the config used to produce them and the
@@ -228,7 +228,7 @@ Rules:
 ## Appendix: tooling commands
 
 ```bash
-pip install -r requirements-dev.txt
+pip install -r requirements.txt
 ruff format .            # auto-format
 ruff check . --fix       # lint and auto-fix safe issues
 mypy src/                # static type check
