@@ -8,7 +8,7 @@
 This report is organised by assignment task. For each task it states the
 objective, the implementation, the exact command that reproduces the output,
 the artifacts written, and the headline result. It is a companion to
-`report/final_report.md`, which presents the same work as a scientific
+`report/final_report_full.md`, which presents the same work as a scientific
 narrative rather than a task checklist.
 
 Every number quoted here was read from the artifact named beside it. All
@@ -467,7 +467,7 @@ scientific concerns.
 
 **Implementation.** `src/interpret.py` generates the per-candidate narrative
 from the scored artifact. The written analysis is in `README.md` §
-*Main results → Scientific interpretation* and in `report/final_report.md`.
+*Main results → Scientific interpretation* and in `report/final_report_full.md`.
 
 **Command.**
 
@@ -579,60 +579,14 @@ python -m mypy src main.py      # static types
 | `mypy src main.py` | clean (22 source files) |
 | `pytest -q` | **807 passed, 0 failed** in 81 s |
 
-### Two API defects found and fixed
 
-`tests/test_api.py` previously *skipped* because FastAPI was not installed.
-Installing the web dependencies made its 24 tests execute, and 6 of them
-failed, exposing two independent defects in `src/api.py`. Both are now fixed.
-
-1. **`/predict` raised `KeyError: 'total_uncertainty'`.**
-   `ModelService.score()` ended at `apply_viability_gate()`, but
-   `to_prediction()` reads `COL_TOTAL_UNCERTAINTY` — a column added by
-   `score_candidates()`, which `score()` never called.
-
-   *Fix.* The quadrature sum was extracted into `combine_uncertainty()` in
-   `src/predict.py` and is now called by both `score_candidates()` and the
-   API. The split is deliberate: `total_uncertainty` is the one uncertainty
-   quantity that is **absolute** — it depends on the row alone — whereas the
-   normalised uncertainty, priority score and rank are batch-relative. Routing
-   `/predict` through the full `score_candidates()` would have given a single
-   mutation a meaningless batch-relative score instead.
-
-2. **`/prioritize` raised `KeyError: 'mutation_id'`.**
-   `scored.set_index(COL_MUTATION_ID)` consumed the column, which
-   `to_prediction()` then read back off the row.
-
-   *Fix.* `set_index(..., drop=False)`, so the column survives becoming the
-   index.
-
-**Verification of the fix.**
-
-- Full suite: **807 passed, 0 failed**; `ruff` and `mypy` clean.
-- The refactor is **behaviour-preserving**: re-running
-  `python -m src.predict` reproduces `top_10_candidates.csv` and
-  `candidate_predictions.csv` **byte-for-byte** (MD5 unchanged), so no
-  scientific result in this report moved.
-- Live end-to-end check: `/predict` returns HTTP 200 with
-  `total_uncertainty = 0.04316`, equal to
-  √(0.04084² + 0.01396²) — the quadrature is correct. `/prioritize` returns
-  200 and ranks correctly.
-- Documented limitation, measured rather than assumed: a **single**-mutation
-  `/prioritize` request returns a constant `priority_score` of 0.375 whatever
-  the mutation (verified across substitutions spanning ddG +0.06 to +0.31 and
-  function 0.58 to 0.89), because a one-row batch has nothing to rank against.
-  `/predict` with `is_viable` is the correct call for a single mutation. This
-  is now stated in `README.md` § *HTTP API*.
-
-No pipeline stage or scientific result was affected at any point: `src/api.py`
-is an optional service layer that no task above depends on, and the batch path
-in `src/predict.py` always computed the column correctly.
 
 ## 4. Deliverables map
 
 | Deliverable | Location |
 |---|---|
-| Task-wise report *(this document)* | `report/task_wise_report.md` |
-| Technical report | `report/final_report.md`, `report/final_report.pdf` |
+| Task-wise report *(this document)* | `report/task_wise_report.md`, `report/task_wise_report.pdf` |
+| Technical report | `report/final_report_full.md`, `report/final_report_full.pdf` |
 | Repository guide | `README.md` |
 | EDA notebook | `notebooks/exploratory_analysis.ipynb` |
 | Metrics | `results/metrics/` |

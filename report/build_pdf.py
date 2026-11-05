@@ -1,4 +1,4 @@
-"""Render ``final_report.md`` to ``final_report.pdf``.
+"""Render ``final_report_full.md`` to ``final_report_full.pdf``.
 
 The assignment asks for the technical report as a PDF; the report itself is
 authored in Markdown so it stays reviewable in the repository and in diffs.
@@ -46,8 +46,8 @@ from reportlab.platypus import (
 from reportlab.platypus.flowables import Flowable
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
-DEFAULT_SOURCE = PROJECT_ROOT / "report" / "final_report.md"
-DEFAULT_TARGET = PROJECT_ROOT / "report" / "final_report.pdf"
+DEFAULT_SOURCE = PROJECT_ROOT / "report" / "final_report_full.md"
+DEFAULT_TARGET = PROJECT_ROOT / "report" / "final_report_full.pdf"
 
 PAGE_MARGIN = 18 * mm
 BODY_FONT = "Helvetica"

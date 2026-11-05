@@ -352,8 +352,10 @@ cases (CAND0148, CAND0091) that check surfaces a concern the score alone would h
 defensible output is "these five clear an absolute bar, and here is what to distrust about each",
 not a ranked list to be taken on faith.
 
-Full analysis: [report/final_report.pdf](report/final_report.pdf) (6 pages), with the
-extended version in [report/final_report_full.md](report/final_report_full.md).
+Full analysis: [report/final_report_full.pdf](report/final_report_full.pdf), authored in
+[report/final_report_full.md](report/final_report_full.md). A per-task walkthrough — objective,
+command, outputs and key result for each of the ten tasks — is in
+[report/task_wise_report.md](report/task_wise_report.md).
 
 ## Repository structure
 
@@ -388,9 +390,10 @@ results/figures/                Fit and residual plots, strategy comparison, lea
                                 curves, baseline-vs-network comparison
 results/mutation_rankings/      Scored candidates, Top 10, candidate interpretation
 results/models/                 Fitted pipelines, network weights, provenance metadata
-report/final_report.md          Source for the 6-page technical report
-report/final_report.pdf         The report deliverable (built by report/build_pdf.py)
-report/final_report_full.md     Extended version: full derivations, all candidate write-ups
+report/final_report_full.md     Technical report: full derivations, all candidate write-ups
+report/final_report_full.pdf    The report deliverable (built by report/build_pdf.py)
+report/task_wise_report.md      Per-task objective, command, outputs and key result
+report/task_wise_report.pdf     The same, as a PDF
 tests/                          807 tests, mirroring src/
 main.py                         End-to-end orchestration
 docs/CODING_GUIDELINES.md       Standards every change must follow

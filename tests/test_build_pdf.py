@@ -205,7 +205,7 @@ def test_missing_source_is_reported(tmp_path: Path) -> None:
 
 def test_real_report_renders_to_a_pdf(tmp_path: Path) -> None:
     """The actual report still renders, so a new construct in it cannot break the deliverable."""
-    target = tmp_path / "final_report.pdf"
+    target = tmp_path / "final_report_full.pdf"
 
     build_pdf.build(build_pdf.DEFAULT_SOURCE, target)
 

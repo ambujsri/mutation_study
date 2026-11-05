@@ -224,7 +224,7 @@ torch_v2:
   # v1 weighted the two tasks equally, which let the unbounded stability target
   # dominate: functional_score lives on 0-1, so its MSE is ~30x smaller and
   # contributes almost nothing to the gradient. Weighting the function task up
-  # is the correction; see report/final_report.md.
+  # is the correction; see report/final_report_full.md.
   loss_weights:
     stability: 0.3
     function: 0.7
