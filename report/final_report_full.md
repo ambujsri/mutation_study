@@ -532,60 +532,29 @@ Two cautions follow from reading the five together:
 
 ### 8.1 Limitations of this study
 
-- **Synthetic data.** Every number above describes a synthetic dataset. The relationships are
-  generator artefacts, and no biophysical conclusion transfers to real proteins. What does
-  transfer is the *methodology*: the leakage control, the ablation design and the uncertainty
-  audit.
-- **7 labeled families is too few for stable family-grouped CV.** Folds hold 1–2 families and
-  vary 2.3× in size. Pooled metrics mitigate this; they do not remove it. A ±0.05 difference in
-  Spearman between models should not be over-interpreted.
-- **Stability is only coarsely predicted** (R² 0.34, RMSE 0.426). Differences below ~0.4 kcal/mol
-  between candidates are not resolved.
-- **Uncertainty is underestimated.** Section 6.3 shows ensemble spread is blind to domain shift.
-  It quantifies model disagreement, not total predictive error.
-- **Scores are pool-relative.** Rank normalisation is internal to these 180 candidates, so
-  `priority_score` ranks candidates against each other and is not an absolute measure of merit.
-- **No feature attribution.** Section 7 reasons from input values and general biophysics, not from
-  per-prediction attributions. SHAP values on the selected model would make those claims
-  model-grounded, and this is the single cheapest improvement available.
-- **Results are environment-sensitive.** Two runs in one environment agree to floating-point
-  tolerance (6.7e-16) rather than byte-for-byte,
-  but a scikit-learn version change shifts predictions slightly and reorders the Top 10. The
-  pinned versions and seed are recorded in `results/models/training_metadata.json`.
+- **Synthetic data.** Every number above describes a synthetic dataset. The relationships are generator artefacts, and no biophysical conclusion transfers to real proteins. What does transfer is the *methodology*: the leakage control, the ablation design and the uncertainty audit.
+- **7 labeled families is too few for stable family-grouped CV.** Folds hold 1–2 families and vary 2.3× in size. Pooled metrics mitigate this; they do not remove it. A ±0.05 difference in Spearman between models should not be over-interpreted.
+- **Stability is only coarsely predicted** (R² 0.34, RMSE 0.426). Differences below ~0.4 kcal/mol between candidates are not resolved.
+- **Uncertainty is underestimated.** Section 6.3 shows ensemble spread is blind to domain shift. It quantifies model disagreement, not total predictive error.
+- **Scores are pool-relative.** Rank normalisation is internal to these 180 candidates, so `priority_score` ranks candidates against each other and is not an absolute measure of merit.
+- **No feature attribution.** Section 7 reasons from input values and general biophysics, not from per-prediction attributions. SHAP values on the selected model would make those claims model-grounded, and this is the single cheapest improvement available.
+- **Results are environment-sensitive.** Two runs in one environment agree to floating-point tolerance (6.7e-16) rather than byte-for-byte,but a scikit-learn version change shifts predictions slightly and reorders the Top 10. The pinned versions and seed are recorded in `results/models/training_metadata.json`.
 
 ### 8.2 Future directions
 
-**Immediate, highest value given the ablation result: replace the per-protein embedding with a
-mutation-aware representation.** The embedding's failure (Section 5.2) is entirely explained by
-its being constant within a protein. Per-*residue* representations from an ESM-style protein
-language model would give a position-specific vector, and the standard mutation-effect signals —
-the wild-type-vs-mutant log-odds at the mutated position, and pseudo-log-likelihood difference —
-are known strong zero-shot predictors precisely because they vary per mutation. This directly
-addresses the bottleneck the ablation identified rather than adding capacity elsewhere.
+**Immediate, highest value given the ablation result: replace the per-protein embedding with a mutation-aware representation.** The embedding's failure (Section 5.2) is entirely explained by its being constant within a protein. Per-*residue* representations from an ESM-style protein language model would give a position-specific vector, and the standard mutation-effect signals — the wild-type-vs-mutant log-odds at the mutated position, and pseudo-log-likelihood difference —
+are known strong zero-shot predictors precisely because they vary per mutation. This directly addresses the bottleneck the ablation identified rather than adding capacity elsewhere.
 
-**Structure-aware modelling.** With AlphaFold or ESMFold structures, the hand-crafted structural
-features that currently carry the signal could be replaced by learned ones: a graph neural network
-over the residue contact graph, with the mutated residue as the query node, would capture packing
-and the local environment that `solvent_accessibility` and `distance_to_active_site` only
-approximate. Given that the structural block dominates the ablation, better structural features
-are the most promising axis.
+**Structure-aware modelling.** With AlphaFold or ESMFold structures, the hand-crafted structural features that currently carry the signal could be replaced by learned ones: a graph neural network
+over the residue contact graph, with the mutated residue as the query node, would capture packing and the local environment that `solvent_accessibility` and `distance_to_active_site` only
+approximate. Given that the structural block dominates the ablation, better structural features are the most promising axis.
 
-**Honest uncertainty.** Replace fold disagreement with a method sensitive to domain shift: deep
-ensembles trained from different initialisations, Gaussian-process or evidential regression heads,
-or conformal prediction for calibrated intervals with coverage guarantees. A distance-to-training-
-data measure in embedding space would give a continuous OOD score rather than the current binary
-flag.
+**Honest uncertainty.** Replace fold disagreement with a method sensitive to domain shift: deep ensembles trained from different initialisations, Gaussian-process or evidential regression heads,
+or conformal prediction for calibrated intervals with coverage guarantees. A distance-to-training-data measure in embedding space would give a continuous OOD score rather than the current binary flag.
 
-**Validation at scale.** With more families, leave-one-family-out CV becomes practical and would
-give a far more stable family-level estimate than 5-fold grouping over 7 families. Nested CV would
-let hyperparameters be tuned without the optimistic bias that tuning on the selection metric
-introduces.
+**Validation at scale.** With more families, leave-one-family-out CV becomes practical and would give a far more stable family-level estimate than 5-fold grouping over 7 families. Nested CV would let hyperparameters be tuned without the optimistic bias that tuning on the selection metric introduces.
 
-**Active learning.** The natural closing of the loop: use predicted uncertainty plus predicted
-value to choose the next experimental batch, measure, retrain. Given Section 6.3, this requires the
-improved uncertainty estimate first — an acquisition function built on an uncertainty measure that
-is blind to novelty would systematically under-explore exactly the novel families the campaign
-most needs to learn about.
+**Active learning.** The natural closing of the loop: use predicted uncertainty plus predicted value to choose the next experimental batch, measure, retrain. Given Section 6.3, this requires the improved uncertainty estimate first — an acquisition function built on an uncertainty measure that is blind to novelty would systematically under-explore exactly the novel families the campaign most needs to learn about.
 
 ---
 
@@ -608,6 +577,5 @@ python -m src.ablation        --config config/config.yaml
 python -m src.interpret       --config config/config.yaml
 ```
 
-Requires Python ≥ 3.11; see `requirements.txt` for why 3.10 is unsupported. All configuration
-lives in `config/config.yaml`; dataset facts and naming conventions in `src/common/constants.py`.
+Requires Python ≥ 3.11; see `requirements.txt` for why 3.10 is unsupported. All configuration lives in `config/config.yaml`; dataset facts and naming conventions in `src/common/constants.py`.
 Engineering standards are documented in `docs/CODING_GUIDELINES.md`.

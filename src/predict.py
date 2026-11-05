@@ -319,6 +319,29 @@ def apply_viability_gate(df: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
     return out
 
 
+def combine_uncertainty(df: pd.DataFrame) -> pd.DataFrame:
+    """Add the combined fold-spread column, adding the two targets in quadrature.
+
+    The two spreads come from independently trained models, so they add in
+    quadrature rather than linearly.
+
+    This is kept separate from :func:`score_candidates` because it is the one
+    uncertainty quantity that is **absolute**: it depends only on the row, not
+    on the rest of the batch. The normalized uncertainty, the priority score
+    and the rank are all batch-relative, so a caller scoring a single mutation
+    (the ``/predict`` endpoint) wants this column without those.
+
+    Returns:
+        ``df`` with :data:`~src.common.constants.COL_TOTAL_UNCERTAINTY` added.
+    """
+    out = df.copy()
+    spreads = np.vstack(
+        [out[f"{const.PRED_STD_PREFIX}{target}"].to_numpy(dtype=float) for target in const.TARGETS.values()]
+    )
+    out[const.COL_TOTAL_UNCERTAINTY] = np.sqrt((spreads**2).sum(axis=0))
+    return out
+
+
 def score_candidates(df: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
     """Combine the stability and function objectives into one priority score.
 
@@ -361,8 +384,7 @@ def score_candidates(df: pd.DataFrame, cfg: dict[str, Any]) -> pd.DataFrame:
         out[f"{const.NORM_PREFIX}{target}"] = normalized
         objective += weight * normalized
 
-    spreads = np.vstack([out[f"{const.PRED_STD_PREFIX}{t}"].to_numpy(dtype=float) for t in weights])
-    out[const.COL_TOTAL_UNCERTAINTY] = np.sqrt((spreads**2).sum(axis=0))
+    out = combine_uncertainty(out)
     out[const.COL_NORM_UNCERTAINTY] = normalize_objective(out[const.COL_TOTAL_UNCERTAINTY], method)
 
     penalty = float(p["uncertainty_penalty"])

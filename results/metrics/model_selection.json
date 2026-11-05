@@ -1,0 +1,24 @@
+{
+  "stability_ddG": {
+    "model": "gradient_boosting",
+    "metric": "pooled_spearman",
+    "value": 0.5563774892720089,
+    "strategy": "family_group",
+    "ranking": {
+      "gradient_boosting": 0.5563774892720089,
+      "random_forest": 0.5218536175513162,
+      "ridge": 0.5068575530630022
+    }
+  },
+  "functional_score": {
+    "model": "gradient_boosting",
+    "metric": "pooled_spearman",
+    "value": 0.7473993030579519,
+    "strategy": "family_group",
+    "ranking": {
+      "gradient_boosting": 0.7473993030579519,
+      "random_forest": 0.7206593238372646,
+      "ridge": 0.707787092923389
+    }
+  }
+}

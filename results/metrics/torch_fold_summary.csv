@@ -1,0 +1,6 @@
+strategy,fold,best_epoch,stopped_epoch,val_loss,n_inner_train,n_inner_val
+family_group,0,17,42,0.46764993300804725,477,130
+family_group,1,6,31,0.37751774709732805,472,122
+family_group,2,65,90,0.3635302484035492,453,252
+family_group,3,37,62,0.4248055077734448,468,252
+family_group,4,14,39,0.38719454738828873,482,252

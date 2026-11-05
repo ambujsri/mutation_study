@@ -59,6 +59,7 @@ from src.predict import (
     TrainedArtifacts,
     apply_viability_gate,
     build_top_k,
+    combine_uncertainty,
     flag_distribution_shift,
     load_artifacts,
     predict_ensemble,
@@ -260,10 +261,18 @@ class ModelService:
 
     # -- Scoring -----------------------------------------------------------
     def score(self, mutations: list[MutationRequest]) -> pd.DataFrame:
-        """Predict, flag distribution shift and apply the viability gate."""
+        """Predict, combine uncertainty, flag distribution shift and gate.
+
+        Only the *absolute* quantities are computed here — the predictions,
+        their combined spread, the OOD flag and the viability gate. Every
+        batch-relative quantity (normalized objectives, priority score, rank)
+        is added by :meth:`prioritize` instead, because it is meaningless for
+        a request holding a single mutation.
+        """
         frame = self.prepare(mutations)
         predicted = predict_ensemble(frame, self.artifacts, self.cfg)
-        flagged = flag_distribution_shift(predicted, self.train, self.cfg)
+        combined = combine_uncertainty(predicted)
+        flagged = flag_distribution_shift(combined, self.train, self.cfg)
         return apply_viability_gate(flagged, self.cfg)
 
     def prioritize(self, mutations: list[MutationRequest]) -> tuple[pd.DataFrame, pd.DataFrame]:
@@ -427,7 +436,9 @@ def create_app(cfg: dict[str, Any] | None = None) -> FastAPI:
         """
         check_batch(payload.mutations)
         scored, shortlist = service.prioritize(payload.mutations)
-        lookup = scored.set_index(const.COL_MUTATION_ID)
+        # drop=False: ``to_prediction`` reads the id back off the row, so the
+        # column has to survive becoming the index.
+        lookup = scored.set_index(const.COL_MUTATION_ID, drop=False)
         candidates = [
             RankedCandidate(
                 **to_prediction(lookup.loc[row[const.COL_MUTATION_ID]]).model_dump(),

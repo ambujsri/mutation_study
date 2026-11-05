@@ -112,7 +112,7 @@ the leakage audit that every later stage relies on
 Checks:
 
 ```bash
-python -m pytest -q        # 786 tests (test_api.py skips without the web deps)
+python -m pytest -q        # 807 tests, all passing (test_api.py skips without the web deps)
 python -m ruff check .
 python -m mypy src main.py
 ```
@@ -391,7 +391,7 @@ results/models/                 Fitted pipelines, network weights, provenance me
 report/final_report.md          Source for the 6-page technical report
 report/final_report.pdf         The report deliverable (built by report/build_pdf.py)
 report/final_report_full.md     Extended version: full derivations, all candidate write-ups
-tests/                          786 tests, mirroring src/
+tests/                          807 tests, mirroring src/
 main.py                         End-to-end orchestration
 docs/CODING_GUIDELINES.md       Standards every change must follow
 docs/api/example_request.json   Ready-to-paste request body for Postman / curl
@@ -528,6 +528,20 @@ python -m src.api --config config/config.yaml
 `http://127.0.0.1:8000/openapi.json` imports into Postman as a complete
 collection. A ready-made request body is in
 [docs/api/example_request.json](docs/api/example_request.json).
+
+**`/predict` returns only absolute quantities; `/prioritize` adds the relative
+ones.** Both report the two predictions, their per-target fold spreads, the
+combined spread (`total_uncertainty`, the two added in quadrature), the OOD
+flag and the viability verdict — all of which depend on the mutation alone.
+Only `/prioritize` adds the normalised objectives, `priority_score` and
+`priority_rank`, because those are normalised **within the submitted batch**:
+they rank the request's mutations against each other and say nothing about
+absolute merit. Submitting a *single* mutation to `/prioritize` therefore
+returns a constant `priority_score` of 0.375 whatever the mutation — measured
+across substitutions whose predictions range from ddG +0.06 to +0.31 and
+function 0.58 to 0.89 — because a one-row batch has nothing to be ranked
+against. For a single mutation use `/predict` and read `is_viable`, which is
+the absolute judgement.
 
 **Training is not exposed.** A request that blocks for minutes and mutates
 shared artifacts is a batch job with an HTTP trigger, not an API; two
