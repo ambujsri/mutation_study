@@ -20,6 +20,8 @@ over-promise on exactly the candidates that matter most.
 
 ## Dataset description
 
+The dataset spans **36 proteins in 9 families, of which only 7 carry labels**: `PF08` and `PF09` have embeddings and candidate mutations but no labeled examples at all. Counts below are therefore per file, and the 7-vs-9 gap is what makes 32% of the candidate pool out-of-distribution.
+
 | | Rows | Proteins | Families |
 |---|---|---|---|
 | `labeled_mutations.csv` | 840 | 28 | 7 (PF01–PF07) |
